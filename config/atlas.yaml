@@ -1,0 +1,5 @@
+paths:
+  literature_root: /home/alexander/Programmiersprachen/Blender/bvillage_project/research/literature
+
+database:
+  url: postgresql://atlas:atlas@127.0.0.1:5432/atlas
