@@ -29,6 +29,9 @@ from atlas.inspect.identifiers import (
     get_identifier_summary,
 )
 from atlas.normalize.identifiers import dedupe_identifiers, normalize_identifiers
+from atlas.enrich.title_from_text import enrich_titles
+from atlas.enrich.title_from_filename import enrich_titles_from_filename
+from atlas.enrich.ocr_candidates import mark_ocr_candidates
 
 app = typer.Typer(help="Atlas literature catalog CLI.")
 
@@ -280,6 +283,26 @@ def inspect_identifiers(limit: int = 50) -> None:
         typer.echo(
             f"{identifier_type:10} {source:14} {path_short:45} {identifier_value}"
         )
+        
+@app.command("enrich-title-text")
+def enrich_title_text() -> None:
+    """Derive document titles from extracted text."""
+    updated = enrich_titles()
+    typer.echo(f"titles updated from text heuristic: {updated}")
+
+
+@app.command("enrich-title-filename")
+def enrich_title_filename() -> None:
+    """Fill missing titles from filenames."""
+    updated = enrich_titles_from_filename()
+    typer.echo(f"titles updated from filename fallback: {updated}")
+
+
+@app.command("mark-ocr-candidates")
+def mark_ocr_candidates_command() -> None:
+    """Mark documents with no extracted text as OCR candidates."""
+    updated = mark_ocr_candidates()
+    typer.echo(f"ocr candidates marked: {updated}")
         
 def main() -> None:
     app()
