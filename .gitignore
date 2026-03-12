@@ -11,12 +11,14 @@ lib64/
 # Virtual envs
 .venv/
 venv/
+env/
 
 # Build
 build/
 dist/
 *.egg-info/
 bin/
+include/
 
 # Test / coverage
 .pytest_cache/
@@ -33,4 +35,5 @@ htmlcov/
 # Local data
 data/
 tmp/
+generated/
 
