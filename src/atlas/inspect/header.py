@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from atlas.db.connection import get_connection
 from atlas.structure.header_parse import parse_header
+from atlas.structure.header_candidates import extract_header_candidates
 
 
 def _one_line(text: str, limit: int = 120) -> str:
@@ -61,6 +62,7 @@ def inspect_header(limit: int = 20) -> None:
 
     for path, source_text, source_region, title in rows:
         parsed = parse_header(str(source_text), max_lines=40)
+        candidates = extract_header_candidates(str(source_text))
         print(path)
         print(f"  stored title : {title or '-'}")
         print(f"  source region: {source_region}")
@@ -86,5 +88,10 @@ def inspect_header(limit: int = 20) -> None:
             print("  journal lines:")
             for item in parsed.journal_lines[:3]:
                 print(f"    [{item.line_index}] {_one_line(item.text)}")
+                
+        if candidates.title_lines:
+            print("  title candidates:")
+            for line in candidates.title_lines[:5]:
+                print(f"    - {_one_line(line)}")
 
         print()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import typer
+
 from atlas.db.connection import get_connection
 
 
@@ -12,11 +14,11 @@ def _compact(text: str | None, limit: int = 160) -> str:
     return cleaned[: limit - 1].rstrip() + "…"
 
 
-def get_document_regions(limit: int = 50):
+def get_document_regions(limit: int = 50) -> list[tuple]:
     """
     Return document regions for inspection.
 
-    Output columns:
+    Output columns (stable contract):
 
     document_id
     relative_path
@@ -50,10 +52,9 @@ def get_document_regions(limit: int = 50):
                 """,
                 (limit,),
             )
-
             rows = cur.fetchall()
 
-    formatted = []
+    formatted: list[tuple] = []
 
     for (
         document_id,
@@ -65,7 +66,6 @@ def get_document_regions(limit: int = 50):
         char_length,
         preview,
     ) in rows:
-
         formatted.append(
             (
                 document_id,
@@ -80,3 +80,37 @@ def get_document_regions(limit: int = 50):
         )
 
     return formatted
+
+
+def inspect_regions(limit: int = 100) -> None:
+    """Print detected document regions."""
+    rows = get_document_regions(limit=limit)
+
+    if not rows:
+        typer.echo("no regions")
+        return
+
+    current_path = None
+
+    for (
+        _document_id,
+        relative_path,
+        region_index,
+        region_type,
+        start_char,
+        end_char,
+        char_length,
+        preview,
+    ) in rows:
+        if relative_path != current_path:
+            if current_path is not None:
+                typer.echo("")
+            typer.echo(f"{relative_path}")
+            typer.echo("-" * min(len(str(relative_path)), 80))
+            current_path = relative_path
+
+        typer.echo(
+            f"[{region_index}] {region_type:20} "
+            f"chars {start_char:6}-{end_char:<6} "
+            f"len {char_length:6} {preview}"
+        )

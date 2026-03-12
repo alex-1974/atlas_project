@@ -4,6 +4,7 @@ import re
 
 from atlas.db.connection import get_connection
 from atlas.structure.header_parse import extract_header_lines
+from atlas.structure.header_candidates import extract_header_candidates
 
 
 MAX_CANDIDATE_LINES = 12
@@ -405,7 +406,8 @@ def enrich_title_from_text() -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             for document_id, source_text, source_name in rows:
-                lines = extract_header_lines(str(source_text), max_lines=40)
+                candidates = extract_header_candidates(source_text)
+                lines = candidates.title_lines[:40]
                 result = extract_title_from_lines(lines)
 
                 if not result:
@@ -451,7 +453,8 @@ def rescore_existing_titles() -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             for document_id, source_text, source_name in rows:
-                lines = str(source_text).splitlines()
+                candidates = extract_header_candidates(str(source_text))
+                lines = candidates.title_lines[:40]
                 result = extract_title_from_lines(lines)
 
                 if not result:
