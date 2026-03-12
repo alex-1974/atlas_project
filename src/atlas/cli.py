@@ -35,6 +35,16 @@ from atlas.extract.authors import extract_authors
 from atlas.segment.document_regions import segment_document_regions
 from atlas.inspect.regions import inspect_regions
 from atlas.inspect.header import inspect_header
+from atlas.inspect.document_map import inspect_document_map
+from atlas.db.connection import get_connection
+from atlas.document_understanding.persistence.repository import DURepository
+from atlas.document_understanding.blocks.blocks import build_document_map
+from atlas.document_understanding.topology.topology_features import compute_topology
+from atlas.document_understanding.geometry.geometry_features import compute_geometry
+from atlas.document_understanding.signals.signal_detectors import compute_signals
+from atlas.document_understanding.zones.zone_hypotheses import compute_zone_hypotheses
+from atlas.document_understanding.zones.memberships import compute_memberships
+from atlas.document_understanding.zones.semantic_zones import compute_semantic_zones
 
 app = typer.Typer(help="Atlas literature catalog CLI.")
 
@@ -373,6 +383,31 @@ def inspect_header_command(limit: int = 20) -> None:
     """Inspect parsed document headers."""
     inspect_header(limit)
 
+@app.command("inspect-du-map")
+def inspect_du_map(
+    limit: int = 10,
+    path_filter: str | None = None,
+) -> None:
+    inspect_document_map(limit=limit, document_path_filter=path_filter)
+    
+@app.command("du-build-map")
+def du_build_map() -> None:
+    with get_connection() as conn:
+        repo = DURepository(conn)
+
+        build_document_map(repo)
+
+        docs = repo.fetch_documents()
+
+        for document_id, _path in docs:
+            compute_topology(repo, document_id)
+            compute_geometry(repo, document_id)
+            compute_signals(repo, document_id)
+            compute_zone_hypotheses(repo, document_id)
+            compute_memberships(repo, document_id)
+            compute_semantic_zones(repo, document_id)
+
+        conn.commit()
 
 def main() -> None:
     app()
