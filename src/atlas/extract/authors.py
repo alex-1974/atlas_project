@@ -6,6 +6,7 @@ import uuid
 from atlas.db.connection import get_connection
 from atlas.lexicon.loader import score_lexicon_hits
 from atlas.structure.header_parse import extract_header_lines
+from atlas.structure.header_candidates import extract_header_candidates
 
 try:
     from atlas.nlp.ner import extract_person_entities
@@ -317,11 +318,6 @@ def split_author_candidates(raw: str) -> list[str]:
     parts = [_strip_role_markers(p) for p in parts]
     return [p for p in parts if p]
 
-
-def _extract_header_lines_preserve_structure(text: str) -> list[str]:
-    return [_normalize_whitespace(line) for line in extract_header_lines(text, max_lines=40)]
-
-
 def _is_obviously_non_person(text: str) -> bool:
     value = _normalize_whitespace(text)
     if not value:
@@ -447,7 +443,10 @@ def _parse_authors_from_lines(lines: list[str]) -> list[str]:
 
     return results
 
-
+def _extract_header_lines_preserve_structure(text: str) -> list[str]:
+    candidates = extract_header_candidates(text)
+    return [_normalize_whitespace(x) for x in candidates.author_lines]
+    
 def _ner_author_candidates(text: str) -> list[str]:
     header_lines = _extract_header_lines_preserve_structure(text)
     header = "\n".join(header_lines[:12]).strip()
@@ -591,10 +590,14 @@ def parse_authors_from_text(text: str) -> list[tuple[str, int, str]]:
     seen: set[str] = set()
     position = 1
 
-    for source, candidates in (
-        ("text_heuristic", _heuristic_author_candidates(text)),
-        ("ner", _ner_author_candidates(text)),
-    ):
+    heuristic = _heuristic_author_candidates(text)
+
+    if heuristic:
+        sources = [("text_heuristic", heuristic)]
+    else:
+        sources = [("ner", _ner_author_candidates(text))]
+
+    for source, candidates in sources:
         for candidate in candidates:
             cleaned = _strip_role_markers(candidate)
             normalized = normalize_author_name(cleaned)

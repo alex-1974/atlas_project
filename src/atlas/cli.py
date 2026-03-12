@@ -33,7 +33,7 @@ from atlas.enrich.title_from_filename import enrich_titles_from_filename
 from atlas.enrich.ocr_candidates import mark_ocr_candidates
 from atlas.extract.authors import extract_authors
 from atlas.segment.document_regions import segment_document_regions
-from atlas.inspect.regions import get_document_regions
+from atlas.inspect.regions import inspect_regions
 from atlas.inspect.header import inspect_header
 
 app = typer.Typer(help="Atlas literature catalog CLI.")
@@ -196,32 +196,9 @@ def inspect_ocr_candidates(limit: int = 100) -> None:
 
 
 @app.command("inspect-regions")
-def inspect_regions(limit: int = 100) -> None:
+def inspect_regions_command(limit: int = 100) -> None:
     """Show detected document regions."""
-    rows = get_document_regions(limit=limit)
-
-    if not rows:
-        typer.echo("no regions")
-        return
-
-    current_path = None
-
-    for row in rows:
-        if len(row) == 7:
-            document_id, relative_path, region_index, region_type, start_char, end_char, preview = row
-        else:
-            relative_path, region_index, region_type, start_char, end_char, preview = row
-
-        if relative_path != current_path:
-            if current_path is not None:
-                typer.echo("")
-            typer.echo(f"{relative_path}")
-            typer.echo("-" * min(len(str(relative_path)), 80))
-            current_path = relative_path
-
-        typer.echo(
-            f"[{region_index}] {region_type:20} chars {start_char:6}-{end_char:<6} {preview}"
-        )
+    inspect_regions(limit=limit)
 
 
 @app.command("state-summary")
