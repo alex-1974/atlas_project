@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *.so
 .python-version
+activate/
+lib/
+lib64/
+.*/
 
 # Virtual envs
 .venv/
@@ -12,6 +16,7 @@ venv/
 build/
 dist/
 *.egg-info/
+bin/
 
 # Test / coverage
 .pytest_cache/
@@ -28,3 +33,4 @@ htmlcov/
 # Local data
 data/
 tmp/
+
