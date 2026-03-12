@@ -1,0 +1,620 @@
+# Atlas DEV_ROADMAP
+
+## Document Understanding / Textstruktur
+
+## Ziel
+
+Atlas soll Dokumente künftig **strukturell verstehen**, bevor Metadaten extrahiert werden.
+
+Pipeline:
+
+```
+pdf/text
+ ↓
+block segmentation
+ ↓
+region detection
+ ↓
+field extraction
+ ↓
+semantic enrichment
+```
+
+---
+
+# Phase 1 — Region Detection (MVP)
+
+Ziel:
+
+Grundlegende Dokumentregionen erkennen.
+
+```
+front_matter
+abstract_or_summary
+body
+references
+```
+
+Diese vier reichen bereits für massive Qualitätsverbesserung.
+
+---
+
+# 1.1 Datenbankschema
+
+Neue Tabelle:
+
+```
+document_regions
+```
+
+Schema:
+
+```sql
+create table document_regions (
+    region_id uuid primary key default gen_random_uuid(),
+
+    document_id uuid not null
+        references documents(document_id)
+        on delete cascade,
+
+    region_index integer not null,
+    region_type text not null,
+
+    start_char integer not null,
+    end_char integer not null,
+
+    text text,
+
+    confidence real,
+
+    created_at timestamptz default now()
+);
+```
+
+Index:
+
+```sql
+create index idx_document_regions_doc
+on document_regions(document_id);
+```
+
+---
+
+# 1.2 Neue Module
+
+Neue Struktur:
+
+```
+src/atlas/segment/
+```
+
+Module:
+
+```
+document_regions.py
+block_segmentation.py
+front_matter.py
+references.py
+abstract.py
+```
+
+---
+
+# 1.3 Block Segmentation
+
+Datei:
+
+```
+segment/block_segmentation.py
+```
+
+Aufgabe:
+
+Text → Textblöcke.
+
+Heuristik:
+
+Block beginnt wenn:
+
+```
+leerzeile
+oder
+starker zeilenlängenwechsel
+```
+
+Blocktypen:
+
+```
+paragraph
+heading
+single_line
+list
+```
+
+Return:
+
+```
+Block(
+    start_char,
+    end_char,
+    text
+)
+```
+
+---
+
+# 1.4 Front Matter Detection
+
+Datei:
+
+```
+segment/front_matter.py
+```
+
+Algorithmus:
+
+1. nur erste 2000–3000 Zeichen analysieren
+2. erste Blöcke sammeln
+3. Region endet bei Marker:
+
+```
+abstract
+summary
+zusammenfassung
+keywords
+introduction
+einleitung
+```
+
+oder wenn:
+
+```
+mehrere satzartige Absätze beginnen
+```
+
+Output:
+
+```
+region_type = front_matter
+```
+
+---
+
+# 1.5 Abstract Detection
+
+Datei:
+
+```
+segment/abstract.py
+```
+
+Primär:
+
+Marker:
+
+```
+abstract
+summary
+zusammenfassung
+résumé
+```
+
+Sekundär:
+
+Wenn kein Marker:
+
+```
+erster dichter Absatz nach front_matter
+```
+
+---
+
+# 1.6 Reference Detection
+
+Datei:
+
+```
+segment/references.py
+```
+
+Marker:
+
+```
+references
+bibliography
+literatur
+literaturverzeichnis
+works cited
+```
+
+Fallback-Heuristik:
+
+Statistik:
+
+```
+year density
+comma density
+person density
+```
+
+Wenn hoch → references.
+
+---
+
+# 1.7 Region Orchestrator
+
+Datei:
+
+```
+segment/document_regions.py
+```
+
+Pipeline:
+
+```
+blocks = segment_blocks(text)
+
+front_matter = detect_front_matter(blocks)
+
+abstract = detect_abstract(blocks)
+
+references = detect_references(blocks)
+
+body = rest
+```
+
+Output:
+
+Liste von Regionen.
+
+---
+
+# Phase 2 — Field Extraction auf Regionen umstellen
+
+Ziel:
+
+Metadaten nur aus relevanten Regionen extrahieren.
+
+---
+
+# 2.1 Titel
+
+Datei:
+
+```
+extract/title.py
+```
+
+Quelle:
+
+```
+front_matter
+```
+
+Kandidaten:
+
+```
+erste 5 Zeilen
+```
+
+Ranking-Features:
+
+```
+position
+length
+capitalization
+punctuation
+NER
+```
+
+---
+
+# 2.2 Autoren
+
+Datei:
+
+```
+extract/authors.py
+```
+
+Änderung:
+
+NER nur auf:
+
+```
+front_matter
+```
+
+nicht auf Volltext.
+
+Zusätzliche Filter:
+
+```
+institution keywords
+topic keywords
+>4 tokens
+```
+
+Clusterbonus:
+
+```
+mehrere PERSON-Entities hintereinander
+```
+
+---
+
+# 2.3 Datum
+
+Datei:
+
+```
+extract/date.py
+```
+
+Quelle:
+
+```
+front_matter
+```
+
+Regex:
+
+```
+19xx
+20xx
+```
+
+Priorität:
+
+```
+nähe zu titel/autor
+```
+
+---
+
+# 2.4 Summary Text
+
+Neues Feld:
+
+```
+documents.summary_text
+```
+
+Quelle:
+
+```
+abstract_or_summary
+```
+
+Fallback:
+
+```
+first body paragraph
+```
+
+---
+
+# Phase 3 — TOC Detection
+
+Datei:
+
+```
+segment/toc.py
+```
+
+Marker:
+
+```
+contents
+inhalt
+table of contents
+```
+
+Heuristik:
+
+```
+viele kurze Zeilen
+zahlen am zeilenende
+leader dots
+```
+
+Region:
+
+```
+toc
+```
+
+---
+
+# Phase 4 — Referenzextraktion
+
+Datei:
+
+```
+extract/references.py
+```
+
+Input:
+
+```
+references region
+```
+
+Regex:
+
+```
+Smith (1999)
+Smith J., Title, 1999
+```
+
+Output:
+
+```
+document_references
+```
+
+Später:
+
+```
+citation graph
+```
+
+---
+
+# Phase 5 — Body Section Detection
+
+Datei:
+
+```
+segment/body_sections.py
+```
+
+Algorithmus:
+
+```
+TextTiling
+```
+
+Ziel:
+
+```
+body subsections
+```
+
+Beispiel:
+
+```
+introduction
+methods
+results
+discussion
+```
+
+oder
+
+essayartige Abschnitte.
+
+---
+
+# Phase 6 — Dokumenttypklassifikation
+
+Datei:
+
+```
+classify/document_type.py
+```
+
+Klassen:
+
+```
+journal_article
+essay
+report
+book_chapter
+archival_text
+```
+
+Features:
+
+```
+abstract vorhanden
+toc vorhanden
+references vorhanden
+```
+
+Classifier:
+
+```
+TF-IDF + logistic regression
+```
+
+---
+
+# Neue CLI Commands
+
+```
+atlas segment-regions
+atlas inspect-regions
+atlas extract-title
+atlas extract-authors
+atlas extract-summary
+atlas extract-references
+```
+
+---
+
+# Evaluation
+
+Goldset:
+
+30 Dokumente.
+
+Mix:
+
+```
+10 journal articles
+10 essays
+10 archival texts
+```
+
+Annotation:
+
+```
+title
+authors
+year
+front_matter end
+references start
+summary
+```
+
+---
+
+# Erwartete Verbesserungen
+
+Autoren-Precision:
+
+```
+~70% → >90%
+```
+
+Titel-Precision:
+
+```
+~60% → >90%
+```
+
+Summary-Extraktion:
+
+```
+neu möglich
+```
+
+---
+
+# Wichtigste Designentscheidung
+
+Atlas wird damit von
+
+```
+text mining
+```
+
+zu
+
+```
+document understanding
+```
+
+umgebaut.
+
+Das ist der **entscheidende Schritt**, um später möglich zu machen:
+
+```
+citation networks
+author graphs
+topic landscapes
+literature clustering
+```
+
+---

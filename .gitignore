@@ -37,3 +37,9 @@ data/
 tmp/
 generated/
 
+
+lib64
+
+pyvenv.cfg
+
+rc
