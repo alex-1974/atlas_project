@@ -7,6 +7,7 @@ from atlas.db.connection import get_connection
 from atlas.lexicon.loader import score_lexicon_hits
 from atlas.structure.header_parse import extract_header_lines
 from atlas.structure.header_candidates import extract_header_candidates
+from atlas.structure.document_kind import score_document_kind
 
 try:
     from atlas.nlp.ner import extract_person_entities
@@ -582,46 +583,7 @@ def _insert_document_author(
             return cur.rowcount == 1
 
 
-def parse_authors_from_text(text: str) -> list[tuple[str, int, str]]:
-    if not text:
-        return []
-
-    results: list[tuple[str, int, str]] = []
-    seen: set[str] = set()
-    position = 1
-
-    heuristic = _heuristic_author_candidates(text)
-
-    if heuristic:
-        sources = [("text_heuristic", heuristic)]
-    else:
-        sources = [("ner", _ner_author_candidates(text))]
-
-    for source, candidates in sources:
-        for candidate in candidates:
-            cleaned = _strip_role_markers(candidate)
-            normalized = normalize_author_name(cleaned)
-
-            if not normalized:
-                continue
-            if normalized in seen:
-                continue
-            if not _looks_like_person_name(cleaned):
-                continue
-            if _author_penalty(cleaned) >= 0.9:
-                continue
-
-            split_names = _split_two_twoword_names(cleaned)
-            if split_names is not None:
-                split_norms = [normalize_author_name(x) for x in split_names]
-                if all(n in seen for n in split_norms):
-                    continue
-
-            seen.add(normalized)
-            results.append((cleaned, position, source))
-            position += 1
-
-    return results
+from atlas.structure.document_kind import score_document_kind
 
 
 def extract_authors_from_pdf_metadata() -> int:
@@ -666,6 +628,60 @@ def extract_authors_from_pdf_metadata() -> int:
 
     return inserted
 
+def parse_authors_from_text(text: str) -> list[tuple[str, int, str]]:
+    if not text:
+        return []
+
+    results: list[tuple[str, int, str]] = []
+    seen: set[str] = set()
+    position = 1
+
+    kind = score_document_kind(text)
+    best_kind, best_score = kind.best_kind()
+
+    heuristic = _heuristic_author_candidates(text)
+
+    sources: list[tuple[str, list[str]]] = []
+
+    if heuristic:
+        sources.append(("text_heuristic", heuristic))
+
+        # For article-like documents, NER may add missing names.
+        if best_kind in {"article_like", "magazine_article_like"} and best_score >= 0.65:
+            ner_candidates = _ner_author_candidates(text)
+            if ner_candidates:
+                sources.append(("ner", ner_candidates))
+    else:
+        ner_candidates = _ner_author_candidates(text)
+        if ner_candidates:
+            sources.append(("ner", ner_candidates))
+
+    for source, candidates in sources:
+        for candidate in candidates:
+            cleaned = _strip_role_markers(candidate)
+            normalized = normalize_author_name(cleaned)
+
+            if not normalized:
+                continue
+            if normalized in seen:
+                continue
+            if not _looks_like_person_name(cleaned):
+                continue
+            if _author_penalty(cleaned) >= 0.9:
+                continue
+
+            split_names = _split_two_twoword_names(cleaned)
+            if split_names is not None:
+                split_norms = [normalize_author_name(x) for x in split_names]
+                if all(n in seen for n in split_norms):
+                    continue
+
+            seen.add(normalized)
+            results.append((cleaned, position, source))
+            position += 1
+
+    return results
+
 
 def extract_authors_from_text() -> int:
     inserted = 0
@@ -709,7 +725,7 @@ def extract_authors_from_text() -> int:
             rows = cur.fetchall()
 
     for document_id, source_text in rows:
-        candidates = parse_authors_from_text(source_text)
+        candidates = parse_authors_from_text(str(source_text))
 
         for display_name, author_position, source in candidates:
             author_id = _upsert_author(display_name)

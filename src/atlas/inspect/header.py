@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from atlas.db.connection import get_connection
 from atlas.structure.header_parse import parse_header
-from atlas.structure.header_candidates import extract_header_candidates
+from atlas.structure.document_kind import score_document_kind
 
 
 def _one_line(text: str, limit: int = 120) -> str:
@@ -61,12 +61,27 @@ def inspect_header(limit: int = 20) -> None:
             rows = cur.fetchall()
 
     for path, source_text, source_region, title in rows:
-        parsed = parse_header(str(source_text), max_lines=40)
-        candidates = extract_header_candidates(str(source_text))
+        text = str(source_text)
+        parsed = parse_header(text, max_lines=40)
+        kind = score_document_kind(text)
+        best_kind, best_score = kind.best_kind()
+
         print(path)
         print(f"  stored title : {title or '-'}")
         print(f"  source region: {source_region}")
         print(f"  header lines : {len(parsed.lines)}")
+        print(f"  document kind: {best_kind} ({best_score:.2f})")
+        print(
+            "  kind scores  : "
+            f"article={kind.article_like:.2f}, "
+            f"magazine={kind.magazine_article_like:.2f}, "
+            f"thesis={kind.thesis_like:.2f}, "
+            f"report={kind.report_like:.2f}, "
+            f"teaching={kind.teaching_material_like:.2f}, "
+            f"chapter={kind.book_chapter_like:.2f}, "
+            f"toc={kind.toc_document_like:.2f}"
+        )
+
         if parsed.lines:
             print("  header preview:")
             for item in parsed.lines[:5]:
@@ -88,10 +103,5 @@ def inspect_header(limit: int = 20) -> None:
             print("  journal lines:")
             for item in parsed.journal_lines[:3]:
                 print(f"    [{item.line_index}] {_one_line(item.text)}")
-                
-        if candidates.title_lines:
-            print("  title candidates:")
-            for line in candidates.title_lines[:5]:
-                print(f"    - {_one_line(line)}")
 
         print()
