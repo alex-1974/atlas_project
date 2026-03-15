@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import time
+
 import typer
 
 from atlas.db.migrate import run_migrations
@@ -36,17 +39,70 @@ from atlas.segment.document_regions import segment_document_regions
 from atlas.inspect.regions import inspect_regions
 from atlas.inspect.header import inspect_header
 from atlas.inspect.document_map import inspect_document_map
-from atlas.db.connection import get_connection
-from atlas.document_understanding.persistence.repository import DURepository
-from atlas.document_understanding.blocks.blocks import build_document_map
-from atlas.document_understanding.topology.topology_features import compute_topology
-from atlas.document_understanding.geometry.geometry_features import compute_geometry
-from atlas.document_understanding.signals.signal_detectors import compute_signals
-from atlas.document_understanding.zones.zone_hypotheses import compute_zone_hypotheses
-from atlas.document_understanding.zones.memberships import compute_memberships
-from atlas.document_understanding.zones.semantic_zones import compute_semantic_zones
+
+from atlas.inspect.du_roles import inspect_du_roles
+from atlas.inspect.du_document_type import inspect_du_document_type
+from atlas.inspect.du_columns import inspect_du_columns
+from atlas.inspect.du_sections import inspect_du_sections
+from atlas.document_understanding.structure.section_tree import compute_section_tree
 
 app = typer.Typer(help="Atlas literature catalog CLI.")
+
+
+def du_build_process_document(args):
+    from atlas.db.connection import get_connection
+    from atlas.document_understanding.persistence.repository import DURepository
+    from atlas.document_understanding.blocks.blocks import build_document
+    from atlas.document_understanding.topology.topology_features import compute_topology
+    from atlas.document_understanding.geometry.geometry_features import compute_geometry
+    from atlas.document_understanding.signals.signal_detectors import compute_signals
+    from atlas.document_understanding.zones.zone_hypotheses import compute_zone_hypotheses
+    from atlas.document_understanding.zones.memberships import compute_memberships
+    from atlas.document_understanding.zones.semantic_zones import compute_semantic_zones
+
+    document_id, path = args
+
+    t0 = time.perf_counter()
+
+    with get_connection() as conn:
+        repo = DURepository(conn)
+
+        t_build_0 = time.perf_counter()
+        build_document(repo, document_id)
+        t_build_1 = time.perf_counter()
+
+        compute_topology(repo, document_id)
+        t_topology_1 = time.perf_counter()
+
+        compute_geometry(repo, document_id)
+        t_geometry_1 = time.perf_counter()
+
+        compute_signals(repo, document_id)
+        t_signals_1 = time.perf_counter()
+
+        compute_section_tree(repo, document_id)
+        t_sections_1 = time.perf_counter()
+
+        compute_zone_hypotheses(repo, document_id)
+        t_hypotheses_1 = time.perf_counter()
+
+        compute_memberships(repo, document_id)
+        t_memberships_1 = time.perf_counter()
+
+        compute_semantic_zones(repo, document_id)
+        t_semantic_1 = time.perf_counter()
+
+    return {
+        "path": path,
+        "build": t_build_1 - t_build_0,
+        "topology": t_topology_1 - t_build_1,
+        "geometry": t_geometry_1 - t_topology_1,
+        "signals": t_signals_1 - t_geometry_1,
+        "hypotheses": t_hypotheses_1 - t_signals_1,
+        "memberships": t_memberships_1 - t_hypotheses_1,
+        "semantic": t_semantic_1 - t_memberships_1,
+        "total": t_semantic_1 - t0,
+    }
 
 
 @app.command()
@@ -383,31 +439,97 @@ def inspect_header_command(limit: int = 20) -> None:
     """Inspect parsed document headers."""
     inspect_header(limit)
 
+
 @app.command("inspect-du-map")
 def inspect_du_map(
     limit: int = 10,
     path_filter: str | None = None,
 ) -> None:
+    """Inspect DU block / signal / zone map."""
     inspect_document_map(limit=limit, document_path_filter=path_filter)
-    
+
+
+@app.command("inspect-du-roles")
+def inspect_du_roles_command(
+    limit: int = 5,
+    path_filter: str | None = None,
+) -> None:
+    """Inspect inferred DU block roles."""
+    inspect_du_roles(limit=limit, path_filter=path_filter)
+
+
+@app.command("inspect-du-document-type")
+def inspect_du_document_type_command(
+    limit: int = 20,
+    path_filter: str | None = None,
+) -> None:
+    """Inspect inferred DU document types."""
+    inspect_du_document_type(limit=limit, path_filter=path_filter)
+
+
+@app.command("inspect-du-columns")
+def inspect_du_columns_command(limit: int = 5) -> None:
+    """Inspect inferred DU columns."""
+    inspect_du_columns(limit)
+
+
+@app.command("inspect-du-sections")
+def inspect_du_sections_command(limit: int = 5) -> None:
+    """Inspect inferred DU section tree."""
+    inspect_du_sections(limit)
+
+
 @app.command("du-build-map")
-def du_build_map() -> None:
+def du_build_map(workers: int = 4) -> None:
+    from atlas.db.connection import get_connection
+    from atlas.document_understanding.persistence.repository import DURepository
+
     with get_connection() as conn:
         repo = DURepository(conn)
-
-        build_document_map(repo)
-
         docs = repo.fetch_documents()
 
-        for document_id, _path in docs:
-            compute_topology(repo, document_id)
-            compute_geometry(repo, document_id)
-            compute_signals(repo, document_id)
-            compute_zone_hypotheses(repo, document_id)
-            compute_memberships(repo, document_id)
-            compute_semantic_zones(repo, document_id)
+    print(f"DU build: processing {len(docs)} documents with {workers} workers")
 
-        conn.commit()
+    totals = {
+        "build": 0.0,
+        "topology": 0.0,
+        "geometry": 0.0,
+        "signals": 0.0,
+        "hypotheses": 0.0,
+        "memberships": 0.0,
+        "semantic": 0.0,
+        "total": 0.0,
+    }
+
+    t0 = time.perf_counter()
+
+    with mp.Pool(workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(du_build_process_document, docs), 1):
+            print(f"[{i}/{len(docs)}] {result['path']}")
+
+            totals["build"] += result["build"]
+            totals["topology"] += result["topology"]
+            totals["geometry"] += result["geometry"]
+            totals["signals"] += result["signals"]
+            totals["hypotheses"] += result["hypotheses"]
+            totals["memberships"] += result["memberships"]
+            totals["semantic"] += result["semantic"]
+            totals["total"] += result["total"]
+
+    t1 = time.perf_counter()
+
+    print("DU build: stage totals")
+    print(f"    build       {totals['build']:.3f}s")
+    print(f"    topology    {totals['topology']:.3f}s")
+    print(f"    geometry    {totals['geometry']:.3f}s")
+    print(f"    signals     {totals['signals']:.3f}s")
+    print(f"    hypotheses  {totals['hypotheses']:.3f}s")
+    print(f"    memberships {totals['memberships']:.3f}s")
+    print(f"    semantic    {totals['semantic']:.3f}s")
+    print(f"    total       {totals['total']:.3f}s")
+    print(f"DU build: wall time {t1 - t0:.3f}s")
+    print("DU build: done")
+
 
 def main() -> None:
     app()

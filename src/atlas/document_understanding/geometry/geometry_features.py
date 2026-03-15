@@ -12,10 +12,12 @@ def compute_geometry(repo: DURepository, document_id: str) -> None:
 
     rows = []
 
+    block_count = len(blocks)
+
     for i, block in enumerate(blocks):
 
         prev_block = blocks[i - 1] if i > 0 else None
-        next_block = blocks[i + 1] if i < len(blocks) - 1 else None
+        next_block = blocks[i + 1] if i < block_count - 1 else None
 
         text = block["text"]
 
@@ -33,24 +35,24 @@ def compute_geometry(repo: DURepository, document_id: str) -> None:
         indent_left = leading_spaces(text)
         indent_right = trailing_spaces(text)
 
-        centeredness = compute_centeredness(text)
+        centeredness = compute_centeredness(indent_left, indent_right)
 
         rows.append(
-            {
-                "block_id": block["block_id"],
-                "width": length,
-                "height": 1,
-                "center_x": None,
-                "center_y": None,
-                "whitespace_before": whitespace_before,
-                "whitespace_after": whitespace_after,
-                "indent_left": indent_left,
-                "indent_right": indent_right,
-                "centeredness": centeredness,
-                "column_hint": None,
-                "near_page_top": near_page_top(block),
-                "near_page_bottom": near_page_bottom(block),
-            }
+            (
+                block["block_id"],
+                length,
+                1,
+                None,
+                None,
+                whitespace_before,
+                whitespace_after,
+                indent_left,
+                indent_right,
+                centeredness,
+                None,
+                near_page_top(block),
+                near_page_bottom(block),
+            )
         )
 
     insert_geometry(repo, rows)
@@ -77,46 +79,33 @@ def fetch_blocks(repo: DURepository, document_id):
 
 def insert_geometry(repo: DURepository, rows):
 
+    if not rows:
+        return
+
     with repo.conn.cursor() as cur:
 
-        for r in rows:
-
-            cur.execute(
-                """
-                insert into du_block_geometry (
-                    block_id,
-                    width,
-                    height,
-                    center_x,
-                    center_y,
-                    whitespace_before,
-                    whitespace_after,
-                    indent_left,
-                    indent_right,
-                    centeredness,
-                    column_hint,
-                    near_page_top,
-                    near_page_bottom
-                )
-                values (
-                    %(block_id)s,
-                    %(width)s,
-                    %(height)s,
-                    %(center_x)s,
-                    %(center_y)s,
-                    %(whitespace_before)s,
-                    %(whitespace_after)s,
-                    %(indent_left)s,
-                    %(indent_right)s,
-                    %(centeredness)s,
-                    %(column_hint)s,
-                    %(near_page_top)s,
-                    %(near_page_bottom)s
-                )
-                on conflict (block_id) do nothing
-                """,
-                r,
+        cur.executemany(
+            """
+            insert into du_block_geometry (
+                block_id,
+                width,
+                height,
+                center_x,
+                center_y,
+                whitespace_before,
+                whitespace_after,
+                indent_left,
+                indent_right,
+                centeredness,
+                column_hint,
+                near_page_top,
+                near_page_bottom
             )
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            on conflict (block_id) do nothing
+            """,
+            rows,
+        )
 
 
 def leading_spaces(text: str) -> int:
@@ -145,10 +134,7 @@ def trailing_spaces(text: str) -> int:
     return count
 
 
-def compute_centeredness(text: str) -> float:
-
-    left = leading_spaces(text)
-    right = trailing_spaces(text)
+def compute_centeredness(left: int, right: int) -> float:
 
     total = left + right
 
@@ -160,10 +146,12 @@ def compute_centeredness(text: str) -> float:
 
 def near_page_top(block) -> float:
 
-    if block["block_index"] < 5:
+    idx = block["block_index"]
+
+    if idx < 5:
         return 1.0
 
-    if block["block_index"] < 15:
+    if idx < 15:
         return 0.5
 
     return 0.0

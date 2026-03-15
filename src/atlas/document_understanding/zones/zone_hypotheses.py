@@ -4,6 +4,15 @@ from atlas.document_understanding.persistence.repository import DURepository
 
 
 EARLY_BLOCK_LIMIT = 40
+MAP_CLUSTER_WINDOW = 12
+MAP_CLUSTER_THRESHOLD = 4
+
+BODY_START_THRESHOLD = 0.35
+BODY_CONTINUE_THRESHOLD = 0.15
+BODY_GAP_TOLERANCE = 1
+BODY_MIN_RUN_LENGTH = 2
+
+ZONE_SOURCE = "zone_hypotheses_v5"
 
 
 def compute_zone_hypotheses(repo: DURepository, document_id: str) -> None:
@@ -12,85 +21,106 @@ def compute_zone_hypotheses(repo: DURepository, document_id: str) -> None:
     if not blocks:
         return
 
+    block_index_map = {b["block_index"]: b for b in blocks}
     rows = []
 
-    # ---------------------------------------------------------
-    # Header candidate
-    # ---------------------------------------------------------
     header_span = detect_header_candidate(blocks)
     if header_span is not None:
-        start_idx, end_idx, score = header_span
         rows.append(
-            {
-                "document_id": document_id,
-                "zone_type": "header_candidate",
-                "start_block_index": start_idx,
-                "end_block_index": end_idx,
-                "page_start": blocks[start_idx]["page_index"],
-                "page_end": blocks[end_idx]["page_index"],
-                "score": score,
-                "source": "zone_hypotheses_v1",
-            }
+            build_row(document_id, "header_candidate", header_span, block_index_map)
         )
 
-    # ---------------------------------------------------------
-    # TOC candidate
-    # ---------------------------------------------------------
     toc_span = detect_toc_candidate(blocks)
     if toc_span is not None:
-        start_idx, end_idx, score = toc_span
         rows.append(
-            {
-                "document_id": document_id,
-                "zone_type": "toc_candidate",
-                "start_block_index": start_idx,
-                "end_block_index": end_idx,
-                "page_start": blocks[start_idx]["page_index"],
-                "page_end": blocks[end_idx]["page_index"],
-                "score": score,
-                "source": "zone_hypotheses_v1",
-            }
+            build_row(document_id, "toc_candidate", toc_span, block_index_map)
         )
 
-    # ---------------------------------------------------------
-    # References candidate
-    # ---------------------------------------------------------
-    ref_span = detect_references_candidate(blocks)
-    if ref_span is not None:
-        start_idx, end_idx, score = ref_span
+    abstract_span = detect_abstract_candidate(blocks, header_span)
+    if abstract_span is not None:
         rows.append(
-            {
-                "document_id": document_id,
-                "zone_type": "references_candidate",
-                "start_block_index": start_idx,
-                "end_block_index": end_idx,
-                "page_start": blocks[start_idx]["page_index"],
-                "page_end": blocks[end_idx]["page_index"],
-                "score": score,
-                "source": "zone_hypotheses_v1",
-            }
+            build_row(document_id, "abstract_candidate", abstract_span, block_index_map)
         )
 
-    # ---------------------------------------------------------
-    # Body candidate
-    # ---------------------------------------------------------
-    body_span = detect_body_candidate(blocks, header_span, toc_span, ref_span)
-    if body_span is not None:
-        start_idx, end_idx, score = body_span
+    keywords_span = detect_keywords_candidate(blocks)
+    if keywords_span is not None:
         rows.append(
-            {
-                "document_id": document_id,
-                "zone_type": "body_candidate",
-                "start_block_index": start_idx,
-                "end_block_index": end_idx,
-                "page_start": blocks[start_idx]["page_index"],
-                "page_end": blocks[end_idx]["page_index"],
-                "score": score,
-                "source": "zone_hypotheses_v1",
-            }
+            build_row(document_id, "keywords_candidate", keywords_span, block_index_map)
         )
 
-    insert_zone_hypotheses(repo, rows)
+    appendix_span = detect_appendix_candidate(blocks)
+    if appendix_span is not None:
+        rows.append(
+            build_row(document_id, "appendix_candidate", appendix_span, block_index_map)
+        )
+
+    figure_caption_spans = detect_figure_caption_candidates(blocks)
+    for span in figure_caption_spans:
+        rows.append(
+            build_row(
+                document_id,
+                "figure_caption_candidate",
+                span,
+                block_index_map,
+            )
+        )
+
+    table_caption_spans = detect_table_caption_candidates(blocks)
+    for span in table_caption_spans:
+        rows.append(
+            build_row(
+                document_id,
+                "table_caption_candidate",
+                span,
+                block_index_map,
+            )
+        )
+
+    ref_spans = detect_references_candidates(blocks)
+    for span in ref_spans:
+        rows.append(
+            build_row(document_id, "references_candidate", span, block_index_map)
+        )
+
+    body_spans = detect_body_candidates(
+        blocks=blocks,
+        header_span=header_span,
+        toc_span=toc_span,
+        abstract_span=abstract_span,
+        keywords_span=keywords_span,
+        ref_spans=ref_spans,
+        appendix_span=appendix_span,
+        figure_caption_spans=figure_caption_spans,
+        table_caption_spans=table_caption_spans,
+    )
+    for span in body_spans:
+        rows.append(
+            build_row(document_id, "body_candidate", span, block_index_map)
+        )
+
+    insert_zone_hypotheses(repo, document_id, rows)
+
+
+def build_row(
+    document_id: str,
+    zone_type: str,
+    span: tuple[int, int, float],
+    block_index_map: dict[int, dict],
+) -> dict:
+    start_idx, end_idx, score = span
+    start_block = block_index_map[start_idx]
+    end_block = block_index_map[end_idx]
+
+    return {
+        "document_id": document_id,
+        "zone_type": zone_type,
+        "start_block_index": start_idx,
+        "end_block_index": end_idx,
+        "page_start": start_block["page_index"],
+        "page_end": end_block["page_index"],
+        "score": score,
+        "source": ZONE_SOURCE,
+    }
 
 
 def fetch_block_map(repo: DURepository, document_id: str):
@@ -118,6 +148,7 @@ def fetch_block_map(repo: DURepository, document_id: str):
                 coalesce(s.parenthetical_citation_like, 0.0) as parenthetical_citation_like,
                 coalesce(s.journal_meta_like, 0.0) as journal_meta_like,
                 coalesce(s.artifact_like, 0.0) as artifact_like,
+                coalesce(s.map_label_like, 0.0) as map_label_like,
                 coalesce(s.noise_like, 0.0) as noise_like,
 
                 coalesce(g.whitespace_before, 0.0) as whitespace_before,
@@ -143,34 +174,63 @@ def fetch_block_map(repo: DURepository, document_id: str):
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def insert_zone_hypotheses(repo: DURepository, rows) -> None:
+def insert_zone_hypotheses(repo: DURepository, document_id: str, rows) -> None:
     with repo.conn.cursor() as cur:
-        for r in rows:
-            cur.execute(
-                """
-                insert into du_zone_hypotheses (
-                    document_id,
-                    zone_type,
-                    start_block_index,
-                    end_block_index,
-                    page_start,
-                    page_end,
-                    score,
-                    source
-                )
-                values (
-                    %(document_id)s,
-                    %(zone_type)s,
-                    %(start_block_index)s,
-                    %(end_block_index)s,
-                    %(page_start)s,
-                    %(page_end)s,
-                    %(score)s,
-                    %(source)s
-                )
-                """,
-                r,
+        cur.execute(
+            """
+            delete from du_zone_hypotheses
+            where document_id = %s
+              and source = %s
+            """,
+            (document_id, ZONE_SOURCE),
+        )
+
+        if not rows:
+            return
+
+        cur.executemany(
+            """
+            insert into du_zone_hypotheses (
+                document_id,
+                zone_type,
+                start_block_index,
+                end_block_index,
+                page_start,
+                page_end,
+                score,
+                source
             )
+            values (
+                %(document_id)s,
+                %(zone_type)s,
+                %(start_block_index)s,
+                %(end_block_index)s,
+                %(page_start)s,
+                %(page_end)s,
+                %(score)s,
+                %(source)s
+            )
+            """,
+            rows,
+        )
+
+
+def detect_map_label_clusters(blocks):
+    flagged = set()
+
+    for i in range(len(blocks)):
+        window = blocks[i : i + MAP_CLUSTER_WINDOW]
+        if not window:
+            continue
+
+        map_count = sum(1 for b in window if b["map_label_like"] > 0.6)
+
+        if map_count >= MAP_CLUSTER_THRESHOLD:
+            for b in window:
+                if b["map_label_like"] > 0.5:
+                    flagged.add(b["block_index"])
+
+    return flagged
 
 
 def detect_header_candidate(blocks):
@@ -199,7 +259,8 @@ def detect_header_candidate(blocks):
             + 1.2 * b["toc_like"]
             + 1.0 * b["reference_like"]
             + 1.0 * b["caption_like"]
-            + 1.0 * b["artifact_like"]
+            + 1.2 * b["artifact_like"]
+            + 1.5 * b["map_label_like"]
             + 1.0 * b["noise_like"]
         )
 
@@ -255,83 +316,276 @@ def detect_toc_candidate(blocks):
     return best
 
 
-def detect_references_candidate(blocks):
-    best = None
-
-    for i, b in enumerate(blocks):
-        score = b["reference_like"] + b["bibliographic_entry_like"] + 0.4 * b["parenthetical_citation_like"]
-
-        if score < 0.8:
-            continue
-
-        start = b["block_index"]
-        end = start
-        total = score
-        count = 1
-
-        for j in range(i + 1, min(i + 30, len(blocks))):
-            nb = blocks[j]
-            nscore = nb["reference_like"] + nb["bibliographic_entry_like"]
-
-            if nscore > 0.4:
-                end = nb["block_index"]
-                total += nscore
-                count += 1
-            else:
-                break
-
-        candidate = (start, end, total / count)
-
-        if best is None or candidate[2] > best[2]:
-            best = candidate
-
-    return best
-
-
-def detect_body_candidate(blocks, header_span, toc_span, ref_span):
-    if not blocks:
+def detect_abstract_candidate(blocks, header_span):
+    if header_span is None:
         return None
 
-    start = 0
+    start_limit = header_span[1] + 1
+    early = [b for b in blocks if b["block_index"] >= start_limit][:30]
 
-    if header_span is not None:
-        start = max(start, header_span[1] + 1)
-
-    if toc_span is not None:
-        start = max(start, toc_span[1] + 1)
-
-    end = len(blocks) - 1
-
-    if ref_span is not None:
-        end = min(end, ref_span[0] - 1)
-
-    if start > end:
+    if not early:
         return None
 
-    total = 0.0
-    count = 0
-    body_start = None
-    body_end = None
+    current = []
+    runs = []
 
-    for i in range(start, end + 1):
-        b = blocks[i]
-
+    for b in early:
         score = (
-            1.4 * b["running_text_like"]
-            + 0.3 * b["heading_like"]
-            - 0.7 * b["toc_like"]
+            1.3 * b["running_text_like"]
+            - 0.8 * b["toc_like"]
             - 0.8 * b["reference_like"]
-            - 0.5 * b["artifact_like"]
+            - 0.8 * b["artifact_like"]
         )
 
-        if score > 0.2:
-            if body_start is None:
-                body_start = b["block_index"]
-            body_end = b["block_index"]
-            total += score
-            count += 1
+        if score > 0.3:
+            current.append((b["block_index"], score))
+        else:
+            if len(current) >= 2:
+                runs.append(collapse_run(current))
+            current = []
 
-    if body_start is None or body_end is None:
+    if current:
+        runs.append(collapse_run(current))
+
+    if not runs:
         return None
 
-    return (body_start, body_end, total / max(count, 1))
+    return max(runs, key=lambda x: x[2])
+
+
+def detect_keywords_candidate(blocks):
+    for b in blocks[:60]:
+        text = (b["text"] or "").lower().strip()
+
+        if (
+            text.startswith("keywords")
+            or text.startswith("key words")
+            or text.startswith("schlagwörter")
+            or text.startswith("schlüsselwörter")
+        ):
+            start = b["block_index"]
+            return (start, start, 0.9)
+
+    return None
+
+
+def detect_appendix_candidate(blocks):
+    late = blocks[int(len(blocks) * 0.6) :]
+
+    for b in late:
+        text = (b["text"] or "").lower().strip()
+
+        if (
+            text.startswith("appendix")
+            or text.startswith("appendices")
+            or text.startswith("anhang")
+        ):
+            start = b["block_index"]
+            return (start, start, 0.9)
+
+    return None
+
+
+def detect_figure_caption_candidates(blocks):
+    spans = []
+
+    for b in blocks:
+        text = (b["text"] or "").lower().strip()
+
+        explicit = (
+            text.startswith("fig.")
+            or text.startswith("figure")
+            or text.startswith("abb.")
+            or text.startswith("abbildung")
+        )
+
+        if explicit or b["caption_like"] > 0.75:
+            spans.append((b["block_index"], b["block_index"], max(0.85, b["caption_like"])))
+
+    return spans
+
+
+def detect_table_caption_candidates(blocks):
+    spans = []
+
+    for b in blocks:
+        text = (b["text"] or "").lower().strip()
+
+        explicit = (
+            text.startswith("table")
+            or text.startswith("tab.")
+            or text.startswith("tabelle")
+        )
+
+        if explicit:
+            spans.append((b["block_index"], b["block_index"], 0.85))
+
+    return spans
+
+
+def detect_references_candidates(blocks):
+    runs = []
+    current = []
+
+    for b in blocks:
+        score = (
+            b["reference_like"]
+            + b["bibliographic_entry_like"]
+            + 0.4 * b["parenthetical_citation_like"]
+        )
+
+        if score >= 0.8:
+            current.append((b["block_index"], score))
+        else:
+            if len(current) >= 1:
+                runs.append(collapse_run(current))
+            current = []
+
+    if current:
+        runs.append(collapse_run(current))
+
+    return runs
+
+
+def collapse_run(run):
+    start = run[0][0]
+    end = run[-1][0]
+    score = sum(x[1] for x in run) / len(run)
+    return (start, end, score)
+
+
+def compute_body_block_score(b, map_cluster_blocks: set[int]) -> float:
+    cluster_penalty = 1.5 if b["block_index"] in map_cluster_blocks else 0.0
+
+    return (
+        1.4 * b["running_text_like"]
+        + 0.3 * b["heading_like"]
+        - 0.7 * b["toc_like"]
+        - 0.8 * b["reference_like"]
+        - 0.8 * b["artifact_like"]
+        - 1.2 * b["map_label_like"]
+        - 0.6 * b["caption_like"]
+        - cluster_penalty
+    )
+
+
+def detect_body_candidates(
+    blocks,
+    header_span,
+    toc_span,
+    abstract_span,
+    keywords_span,
+    ref_spans,
+    appendix_span,
+    figure_caption_spans,
+    table_caption_spans,
+):
+    if not blocks:
+        return []
+
+    map_cluster_blocks = detect_map_label_clusters(blocks)
+
+    excluded = set()
+
+    if header_span is not None:
+        excluded.update(range(header_span[0], header_span[1] + 1))
+
+    if toc_span is not None:
+        excluded.update(range(toc_span[0], toc_span[1] + 1))
+
+    if abstract_span is not None:
+        excluded.update(range(abstract_span[0], abstract_span[1] + 1))
+
+    if keywords_span is not None:
+        excluded.update(range(keywords_span[0], keywords_span[1] + 1))
+
+    if appendix_span is not None:
+        excluded.update(range(appendix_span[0], appendix_span[1] + 1))
+
+    for start, end, _score in ref_spans:
+        excluded.update(range(start, end + 1))
+
+    for start, end, _score in figure_caption_spans:
+        excluded.update(range(start, end + 1))
+
+    for start, end, _score in table_caption_spans:
+        excluded.update(range(start, end + 1))
+
+    min_allowed = 0
+
+    if header_span is not None:
+        min_allowed = max(min_allowed, header_span[1] + 1)
+
+    if toc_span is not None:
+        min_allowed = max(min_allowed, toc_span[1] + 1)
+
+    if abstract_span is not None:
+        min_allowed = max(min_allowed, abstract_span[1] + 1)
+
+    if keywords_span is not None:
+        min_allowed = max(min_allowed, keywords_span[1] + 1)
+
+    candidates = []
+    current_run = []
+    gap_count = 0
+
+    for b in blocks:
+        idx = b["block_index"]
+
+        if idx < min_allowed:
+            continue
+
+        if idx in excluded:
+            if len(current_run) >= BODY_MIN_RUN_LENGTH:
+                trimmed = trim_run_tail(current_run)
+                if len(trimmed) >= BODY_MIN_RUN_LENGTH:
+                    candidates.append(collapse_run(trimmed))
+            current_run = []
+            gap_count = 0
+            continue
+
+        score = compute_body_block_score(b, map_cluster_blocks)
+
+        if not current_run:
+            if score >= BODY_START_THRESHOLD:
+                current_run = [(idx, score)]
+                gap_count = 0
+            continue
+
+        if score >= BODY_CONTINUE_THRESHOLD:
+            current_run.append((idx, score))
+            gap_count = 0
+            continue
+
+        gap_count += 1
+
+        if gap_count <= BODY_GAP_TOLERANCE:
+            current_run.append((idx, max(score, 0.0)))
+            continue
+
+        trimmed = trim_run_tail(current_run)
+
+        if len(trimmed) >= BODY_MIN_RUN_LENGTH:
+            candidates.append(collapse_run(trimmed))
+
+        current_run = []
+        gap_count = 0
+
+        if score >= BODY_START_THRESHOLD:
+            current_run = [(idx, score)]
+
+    if current_run:
+        trimmed = trim_run_tail(current_run)
+        if len(trimmed) >= BODY_MIN_RUN_LENGTH:
+            candidates.append(collapse_run(trimmed))
+
+    return candidates
+
+
+def trim_run_tail(run):
+    trimmed = list(run)
+
+    while trimmed and trimmed[-1][1] <= 0.0:
+        trimmed.pop()
+
+    return trimmed

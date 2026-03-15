@@ -56,88 +56,94 @@ class DURepository:
     # ---------------------------------------------------------
 
     def insert_pages(self, pages: Iterable) -> None:
+        pages = list(pages)
+        if not pages:
+            return
+
         with self.conn.cursor() as cur:
-            for p in pages:
-                cur.execute(
-                    """
-                    insert into du_pages (
-                        document_id,
-                        page_index,
-                        width,
-                        height,
-                        image_based,
-                        native_text_present,
-                        page_confidence
-                    )
-                    values (
-                        %(document_id)s,
-                        %(page_index)s,
-                        %(width)s,
-                        %(height)s,
-                        %(image_based)s,
-                        %(native_text_present)s,
-                        %(page_confidence)s
-                    )
-                    on conflict (document_id, page_index) do nothing
-                    """,
-                    asdict(p),
+            cur.executemany(
+                """
+                insert into du_pages (
+                    document_id,
+                    page_index,
+                    width,
+                    height,
+                    image_based,
+                    native_text_present,
+                    page_confidence
                 )
+                values (
+                    %(document_id)s,
+                    %(page_index)s,
+                    %(width)s,
+                    %(height)s,
+                    %(image_based)s,
+                    %(native_text_present)s,
+                    %(page_confidence)s
+                )
+                on conflict (document_id, page_index) do nothing
+                """,
+                [asdict(p) for p in pages],
+            )
 
     # ---------------------------------------------------------
     # Blocks
     # ---------------------------------------------------------
 
     def insert_blocks(self, blocks: Iterable) -> None:
+        blocks = list(blocks)
+        if not blocks:
+            return
+
         with self.conn.cursor() as cur:
-            for b in blocks:
-                cur.execute(
-                    """
-                    insert into du_blocks (
-                        document_id,
-                        page_index,
-                        block_index,
-                        start_char,
-                        end_char,
-                        text,
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        page_y0,
-                        page_y1,
-                        doc_y0,
-                        doc_y1,
-                        text_source,
-                        geometry_source,
-                        text_confidence,
-                        geometry_confidence,
-                        reading_order_confidence
-                    )
-                    values (
-                        %(document_id)s,
-                        %(page_index)s,
-                        %(block_index)s,
-                        %(start_char)s,
-                        %(end_char)s,
-                        %(text)s,
-                        %(x0)s,
-                        %(y0)s,
-                        %(x1)s,
-                        %(y1)s,
-                        %(page_y0)s,
-                        %(page_y1)s,
-                        %(doc_y0)s,
-                        %(doc_y1)s,
-                        %(text_source)s,
-                        %(geometry_source)s,
-                        %(text_confidence)s,
-                        %(geometry_confidence)s,
-                        %(reading_order_confidence)s
-                    )
-                    on conflict (document_id, block_index) do nothing
-                    """,
-                    asdict(b),
+            cur.executemany(
+                """
+                insert into du_blocks (
+                    document_id,
+                    page_index,
+                    block_index,
+                    start_char,
+                    end_char,
+                    text,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    page_y0,
+                    page_y1,
+                    doc_y0,
+                    doc_y1,
+                    text_source,
+                    geometry_source,
+                    text_confidence,
+                    geometry_confidence,
+                    reading_order_confidence
                 )
+                values (
+                    %(document_id)s,
+                    %(page_index)s,
+                    %(block_index)s,
+                    %(start_char)s,
+                    %(end_char)s,
+                    %(text)s,
+                    %(x0)s,
+                    %(y0)s,
+                    %(x1)s,
+                    %(y1)s,
+                    %(page_y0)s,
+                    %(page_y1)s,
+                    %(doc_y0)s,
+                    %(doc_y1)s,
+                    %(text_source)s,
+                    %(geometry_source)s,
+                    %(text_confidence)s,
+                    %(geometry_confidence)s,
+                    %(reading_order_confidence)s
+                )
+                on conflict (document_id, block_index) do nothing
+                """,
+                [asdict(b) for b in blocks],
+            )
 
     # ---------------------------------------------------------
     # Reads
@@ -190,3 +196,37 @@ class DURepository:
                 (document_id,),
             )
             return cur.fetchall()
+
+    def fetch_blocks(self, document_id):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    block_id,
+                    block_index,
+                    page_index,
+                    text
+                from du_blocks
+                where document_id = %s
+                order by block_index
+                """,
+                (document_id,),
+            )
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            
+def compute_columns(self, document_id: str):
+
+    from atlas.document_understanding.layout.column_detection import (
+        compute_and_store_columns,
+    )
+
+    compute_and_store_columns(self, document_id)
+    
+def compute_section_tree(self, document_id: str):
+
+    from atlas.document_understanding.structure.section_tree import (
+        compute_section_tree,
+    )
+
+    compute_section_tree(self, document_id)

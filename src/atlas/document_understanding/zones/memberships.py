@@ -5,10 +5,12 @@ from atlas.document_understanding.persistence.repository import DURepository
 
 ZONE_TYPES = (
     "header_candidate",
+    "body_candidate",
     "toc_candidate",
     "references_candidate",
-    "body_candidate",
 )
+
+MEMBERSHIP_SOURCE = "memberships_v4_sparse"
 
 
 def compute_memberships(repo: DURepository, document_id: str) -> None:
@@ -18,39 +20,50 @@ def compute_memberships(repo: DURepository, document_id: str) -> None:
     if not blocks:
         return
 
-    hyp_map = build_hypothesis_map(hypotheses)
+    index_to_block_id = {
+        b["block_index"]: b["block_id"]
+        for b in blocks
+    }
 
-    rows = []
+    membership_map: dict[tuple[str, str], float] = {}
 
-    for block in blocks:
-        block_index = block["block_index"]
+    for hypothesis in hypotheses:
+        zone_type = hypothesis["zone_type"]
+        if zone_type not in ZONE_TYPES:
+            continue
 
-        memberships = {}
+        membership = float(hypothesis["score"] or 0.0)
+        if membership <= 0.0:
+            continue
 
-        for zone_type in ZONE_TYPES:
-            memberships[zone_type] = membership_for_block(
-                block_index,
-                hyp_map.get(zone_type),
-            )
+        start_block_index = hypothesis["start_block_index"]
+        end_block_index = hypothesis["end_block_index"]
 
-        for zone_type, membership in memberships.items():
-            rows.append(
-                {
-                    "block_id": block["block_id"],
-                    "zone_type": zone_type,
-                    "membership": membership,
-                    "source": "memberships_v1",
-                }
-            )
+        for block_index in range(start_block_index, end_block_index + 1):
+            block_id = index_to_block_id.get(block_index)
+            if block_id is None:
+                continue
 
-    insert_memberships(repo, rows)
+            key = (block_id, zone_type)
+            prev = membership_map.get(key, 0.0)
+            if membership > prev:
+                membership_map[key] = membership
+
+    rows = [
+        (block_id, zone_type, membership, MEMBERSHIP_SOURCE)
+        for (block_id, zone_type), membership in membership_map.items()
+    ]
+
+    insert_memberships(repo, document_id, rows)
 
 
-def fetch_blocks(repo: DURepository, document_id: str):
+def fetch_blocks(repo: DURepository, document_id: str) -> list[dict]:
     with repo.conn.cursor() as cur:
         cur.execute(
             """
-            select block_id, block_index
+            select
+                block_id,
+                block_index
             from du_blocks
             where document_id = %s
             order by block_index
@@ -58,10 +71,10 @@ def fetch_blocks(repo: DURepository, document_id: str):
             (document_id,),
         )
         cols = [c.name for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def fetch_zone_hypotheses(repo: DURepository, document_id: str):
+def fetch_zone_hypotheses(repo: DURepository, document_id: str) -> list[dict]:
     with repo.conn.cursor() as cur:
         cur.execute(
             """
@@ -72,74 +85,45 @@ def fetch_zone_hypotheses(repo: DURepository, document_id: str):
                 score
             from du_zone_hypotheses
             where document_id = %s
+            order by start_block_index, end_block_index
             """,
             (document_id,),
         )
         cols = [c.name for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def build_hypothesis_map(hypotheses):
-    result = {}
-
-    for h in hypotheses:
-        zone_type = h["zone_type"]
-
-        current = result.get(zone_type)
-
-        if current is None or h["score"] > current["score"]:
-            result[zone_type] = h
-
-    return result
-
-
-def membership_for_block(block_index: int, hypothesis: dict | None) -> float:
-    if hypothesis is None:
-        return 0.0
-
-    start_idx = hypothesis["start_block_index"]
-    end_idx = hypothesis["end_block_index"]
-    score = hypothesis["score"]
-
-    if start_idx > end_idx:
-        return 0.0
-
-    if start_idx <= block_index <= end_idx:
-        return min(1.0, 0.6 + 0.4 * score)
-
-    # soft fringe around the zone
-    distance = min(abs(block_index - start_idx), abs(block_index - end_idx))
-
-    if distance == 1:
-        return min(0.45, 0.25 + 0.15 * score)
-
-    if distance == 2:
-        return min(0.25, 0.10 + 0.10 * score)
-
-    if distance == 3:
-        return 0.08
-
-    return 0.0
-
-
-def insert_memberships(repo: DURepository, rows) -> None:
+def insert_memberships(
+    repo: DURepository,
+    document_id: str,
+    rows: list[tuple[str, str, float, str]],
+) -> None:
     with repo.conn.cursor() as cur:
-        for r in rows:
-            cur.execute(
-                """
-                insert into du_block_zone_memberships (
-                    block_id,
-                    zone_type,
-                    membership,
-                    source
-                )
-                values (
-                    %(block_id)s,
-                    %(zone_type)s,
-                    %(membership)s,
-                    %(source)s
-                )
-                on conflict (block_id, zone_type, source) do nothing
-                """,
-                r,
+        cur.execute(
+            """
+            delete from du_block_zone_memberships
+            where source = %s
+              and block_id in (
+                  select block_id
+                  from du_blocks
+                  where document_id = %s
+              )
+            """,
+            (MEMBERSHIP_SOURCE, document_id),
+        )
+
+        if not rows:
+            return
+
+        cur.executemany(
+            """
+            insert into du_block_zone_memberships (
+                block_id,
+                zone_type,
+                membership,
+                source
             )
+            values (%s, %s, %s, %s)
+            """,
+            rows,
+        )

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
 from atlas.document_understanding.models import (
     DocumentContext,
     Page,
@@ -9,19 +7,10 @@ from atlas.document_understanding.models import (
 )
 
 from atlas.document_understanding.persistence.repository import DURepository
+from atlas.document_understanding.blocks.block_segmentation import segment_page_into_blocks
 
 
 def build_document_map(repo: DURepository) -> None:
-    """
-    Build the minimal Document Map for all documents.
-
-    Fills:
-
-        du_document_context
-        du_pages
-        du_blocks
-    """
-
     docs = repo.fetch_documents()
 
     for document_id, path in docs:
@@ -35,10 +24,6 @@ def build_document(repo: DURepository, document_id: str) -> None:
     if not segments:
         return
 
-    # ---------------------------------------------------------
-    # Document Context (minimal first version)
-    # ---------------------------------------------------------
-
     ctx = DocumentContext(
         document_id=document_id,
         source_kind="unknown",
@@ -50,47 +35,53 @@ def build_document(repo: DURepository, document_id: str) -> None:
     repo.insert_document_context(ctx)
 
     # ---------------------------------------------------------
-    # Pages
+    # Pages (einfach aus Segments ableiten)
     # ---------------------------------------------------------
 
-    pages = {}
-    page_segments = defaultdict(list)
+    pages = []
+    seen_pages = set()
 
     for page_index, segment_index, text in segments:
-        page_segments[page_index].append((segment_index, text))
+        if page_index not in seen_pages:
+            seen_pages.add(page_index)
 
-    page_objects = []
-
-    for page_index in sorted(page_segments):
-
-        page_objects.append(
-            Page(
-                document_id=document_id,
-                page_index=page_index,
-                width=None,
-                height=None,
-                image_based=None,
-                native_text_present=True,
-                page_confidence=None,
+            pages.append(
+                Page(
+                    document_id=document_id,
+                    page_index=page_index,
+                    width=None,
+                    height=None,
+                    image_based=None,
+                    native_text_present=True,
+                    page_confidence=None,
+                )
             )
-        )
 
-    repo.insert_pages(page_objects)
+    repo.insert_pages(pages)
 
     # ---------------------------------------------------------
     # Blocks
     # ---------------------------------------------------------
 
-    blocks = []
     block_index = 0
+    current_page = None
+    page_lines: list[str] = []
 
-    for page_index in sorted(page_segments):
+    def flush_page(page_index: int, lines: list[str]):
+        nonlocal block_index
 
-        segments_on_page = sorted(page_segments[page_index])
+        if not lines:
+            return
 
-        for segment_index, text in segments_on_page:
+        page_text = "\n\n".join(lines)
 
-            blocks.append(
+        du_blocks = segment_page_into_blocks(page_text)
+
+        page_blocks = []
+
+        for text in du_blocks:
+
+            page_blocks.append(
                 Block(
                     document_id=document_id,
                     block_index=block_index,
@@ -116,4 +107,19 @@ def build_document(repo: DURepository, document_id: str) -> None:
 
             block_index += 1
 
-    repo.insert_blocks(blocks)
+        repo.insert_blocks(page_blocks)
+
+    for page_index, segment_index, text in segments:
+
+        if current_page is None:
+            current_page = page_index
+
+        if page_index != current_page:
+            flush_page(current_page, page_lines)
+            page_lines = []
+            current_page = page_index
+
+        if text:
+            page_lines.append(text)
+
+    flush_page(current_page, page_lines)

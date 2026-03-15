@@ -8,6 +8,11 @@ SEMANTIC_MAPPING = {
     "toc_candidate": "toc",
     "references_candidate": "references",
     "body_candidate": "body",
+    "abstract_candidate": "abstract",
+    "keywords_candidate": "keywords",
+    "appendix_candidate": "appendix",
+    "figure_caption_candidate": "figure_caption",
+    "table_caption_candidate": "table_caption",
 }
 
 
@@ -123,49 +128,62 @@ def refine_zone_bounds(
 ):
     zone_memberships = membership_map.get(candidate_type, {})
 
-    block_indices = [
-        idx
+    kept: list[tuple[int, float]] = [
+        (idx, zone_memberships.get(idx, 0.0))
         for idx in range(start_idx, end_idx + 1)
-        if zone_memberships.get(idx, 0.0) >= 0.40
     ]
 
-    if not block_indices:
+    kept = [(idx, val) for idx, val in kept if val >= 0.40]
+
+    if not kept:
         return None
 
-    refined_start = min(block_indices)
-    refined_end = max(block_indices)
-
-    values = [zone_memberships.get(idx, 0.0) for idx in range(refined_start, refined_end + 1)]
-    confidence = sum(values) / max(len(values), 1)
+    refined_start = kept[0][0]
+    refined_end = kept[-1][0]
+    confidence = sum(val for _, val in kept) / len(kept)
 
     return refined_start, refined_end, confidence
 
 
 def insert_semantic_zones(repo: DURepository, rows) -> None:
+    if not rows:
+        return
+
+    document_id = rows[0]["document_id"]
+
     with repo.conn.cursor() as cur:
-        for r in rows:
-            cur.execute(
-                """
-                insert into du_semantic_zones (
-                    document_id,
-                    zone_type,
-                    start_block_index,
-                    end_block_index,
-                    page_start,
-                    page_end,
-                    confidence,
-                    source
-                )
-                values (
-                    %(document_id)s,
-                    %(zone_type)s,
-                    %(start_block_index)s,
-                    %(end_block_index)s,
-                    %(page_start)s,
-                    %(page_end)s,
-                    %(confidence)s,
-                    %(source)s
-                )
-                """,
-                r,
+
+        cur.execute(
+            """
+            delete from du_semantic_zones
+            where document_id = %s
+              and source = 'semantic_zones_v1'
+            """,
+            (document_id,),
+        )
+
+        cur.executemany(
+            """
+            insert into du_semantic_zones (
+                document_id,
+                zone_type,
+                start_block_index,
+                end_block_index,
+                page_start,
+                page_end,
+                confidence,
+                source
             )
+            values (
+                %(document_id)s,
+                %(zone_type)s,
+                %(start_block_index)s,
+                %(end_block_index)s,
+                %(page_start)s,
+                %(page_end)s,
+                %(confidence)s,
+                %(source)s
+            )
+            """,
+            rows,
+        )
