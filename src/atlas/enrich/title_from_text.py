@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 
 from atlas.db.connection import get_connection
-from atlas.structure.header_parse import extract_header_lines
 from atlas.structure.header_candidates import extract_header_candidates
 from atlas.structure.document_kind import score_document_kind
 
@@ -212,7 +211,6 @@ def _score_title_candidate(line_index: int, text: str) -> float:
     elif comma_count == 2:
         score -= 1.5
 
-    # very person-like lines are suspicious as titles
     capitalized_words = sum(1 for w in words if w[:1].isupper())
     if 2 <= length <= 5 and capitalized_words == length and ":" not in text:
         score -= 1.5
@@ -258,7 +256,7 @@ def _needs_review(confidence: float, margin: float, title: str) -> bool:
 
     if DOI_RE.search(lower):
         return True
-        
+
     if PERSON_TITLE_RE.search(lower):
         return True
 
@@ -430,22 +428,12 @@ def enrich_title_from_text() -> int:
                     """
                     update documents
                     set title = %s,
-                        title_source = %s,
-                        title_score_raw = %s,
-                        title_confidence = %s,
-                        title_score_margin = %s,
-                        title_candidate_count = %s,
-                        title_needs_review = %s
+                        title_source = %s
                     where document_id = %s
                     """,
                     (
                         title_to_store,
                         source_to_store,
-                        result["score"],
-                        result["confidence"],
-                        result["margin"],
-                        result["candidate_count"],
-                        review,
                         document_id,
                     ),
                 )
@@ -471,11 +459,8 @@ def rescore_existing_titles() -> int:
                     cur.execute(
                         """
                         update documents
-                        set title_score_raw = null,
-                            title_confidence = null,
-                            title_score_margin = null,
-                            title_candidate_count = null,
-                            title_needs_review = true
+                        set title = null,
+                            title_source = null
                         where document_id = %s
                         """,
                         (document_id,),
@@ -499,22 +484,12 @@ def rescore_existing_titles() -> int:
                     """
                     update documents
                     set title = %s,
-                        title_source = %s,
-                        title_score_raw = %s,
-                        title_confidence = %s,
-                        title_score_margin = %s,
-                        title_candidate_count = %s,
-                        title_needs_review = %s
+                        title_source = %s
                     where document_id = %s
                     """,
                     (
                         title_to_store,
                         source_to_store,
-                        result["score"],
-                        result["confidence"],
-                        result["margin"],
-                        result["candidate_count"],
-                        review,
                         document_id,
                     ),
                 )
