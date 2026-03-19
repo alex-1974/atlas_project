@@ -1,94 +1,57 @@
-# src/atlas/document_understanding/layers/context.py
-
 from __future__ import annotations
 
-from atlas.document_understanding.persistence.repository import Repository
-from atlas.document_understanding.core.coordinate_system import (
-    DocumentCoordinateSystem,
-)
+from atlas.document_understanding.core.coordinate_system import safe_ratio
 
 
-def _front_matter_score(y_ratio: float | None) -> float | None:
-    if y_ratio is None:
-        return None
-
-    if y_ratio < 0.10:
-        return 1.0
-
-    if y_ratio < 0.20:
-        return 0.8
-
-    if y_ratio < 0.35:
-        return 0.4
-
-    return 0.0
-
-
-def _back_matter_score(y_ratio: float | None) -> float | None:
-    if y_ratio is None:
-        return None
-
-    if y_ratio > 0.85:
-        return 1.0
-
-    if y_ratio > 0.70:
-        return 0.6
-
-    if y_ratio > 0.55:
-        return 0.3
-
-    return 0.0
-
-
-def _body_score(front: float | None, back: float | None) -> float | None:
-    if front is None or back is None:
-        return None
-
-    return max(0.0, 1.0 - max(front, back))
-
-
-def compute_context(repository: Repository, doc_id: int) -> None:
-    """
-    Compute document-position context signals for blocks.
-
-    Adds:
-        doc_y_ratio
-        front_matter_score
-        body_score
-        back_matter_score
-        page_top_ratio
-    """
-
-    blocks = repository.fetch_blocks(doc_id)
-
+def compute_context(repo, document_id: str) -> None:
+    blocks = repo.fetch_blocks(document_id)
     if not blocks:
         return
 
-    coord: DocumentCoordinateSystem = repository.fetch_coordinate_system(doc_id)
+    doc_y1_values = [b.get("doc_y1") for b in blocks if b.get("doc_y1") is not None]
+    document_height = max(doc_y1_values) if doc_y1_values else None
 
-    rows = []
+    rows: list[dict] = []
 
     for block in blocks:
-
+        page_height = block.get("page_height")
+        page_y0 = block.get("page_y0")
+        page_y1 = block.get("page_y1")
         doc_y0 = block.get("doc_y0")
-        page_y0 = block.get("y0")
+        doc_y1 = block.get("doc_y1")
 
-        doc_y_ratio = coord.doc_y_ratio(doc_y0)
-        page_y_ratio = coord.page_y_ratio(page_y0)
+        page_center = None
+        if page_y0 is not None and page_y1 is not None:
+            page_center = (float(page_y0) + float(page_y1)) / 2.0
 
-        front = _front_matter_score(doc_y_ratio)
-        back = _back_matter_score(doc_y_ratio)
-        body = _body_score(front, back)
+        doc_center = None
+        if doc_y0 is not None and doc_y1 is not None:
+            doc_center = (float(doc_y0) + float(doc_y1)) / 2.0
+
+        page_y_ratio = safe_ratio(page_center, page_height)
+        doc_y_ratio = safe_ratio(doc_center, document_height)
+
+        front_score = 0.0
+        body_score = 0.0
+        back_score = 0.0
+
+        if doc_y_ratio is not None:
+            if doc_y_ratio <= 0.18:
+                front_score = 1.0 - (doc_y_ratio / 0.18)
+            elif doc_y_ratio >= 0.78:
+                back_score = min(1.0, (doc_y_ratio - 0.78) / 0.22)
+            else:
+                body_score = 1.0
 
         rows.append(
             {
                 "block_id": block["block_id"],
                 "doc_y_ratio": doc_y_ratio,
                 "page_y_ratio": page_y_ratio,
-                "front_matter_score": front,
-                "body_score": body,
-                "back_matter_score": back,
+                "front_matter_score": front_score,
+                "body_score": body_score,
+                "back_matter_score": back_score,
             }
         )
 
-    repository.store_context_features(doc_id, rows)
+    repo.store_context_features(document_id, rows)

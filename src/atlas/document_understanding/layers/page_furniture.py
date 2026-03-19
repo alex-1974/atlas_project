@@ -254,11 +254,11 @@ def compute_page_furniture(repo, document_id: str) -> None:
 
             running_footer_like = bool(
                 not first_page_meta_like
-                and is_bottom_band
+                and _running_footer_text_like(text)
                 and (
                     repeated_across_pages
                     or repeated_same_parity
-                    or _running_footer_text_like(text)
+                    or page_number_like
                 )
             )
 

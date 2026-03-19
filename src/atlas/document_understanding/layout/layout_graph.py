@@ -1,13 +1,9 @@
-# src/atlas/document_understanding/layout/layout_graph.py
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 
 
-HEADER_BAND_RATIO = 0.12
-FOOTER_BAND_RATIO = 0.10
-REPEAT_TEXT_MIN_LEN = 3
 COLUMN_GAP_SPLIT_RATIO = 0.18
 
 
@@ -25,28 +21,10 @@ class LayoutBlock:
     page_height: float | None
 
     @property
-    def width(self) -> float | None:
-        if self.x0 is None or self.x1 is None:
-            return None
-        return float(self.x1) - float(self.x0)
-
-    @property
-    def height(self) -> float | None:
-        if self.y0 is None or self.y1 is None:
-            return None
-        return float(self.y1) - float(self.y0)
-
-    @property
     def center_x(self) -> float | None:
         if self.x0 is None or self.x1 is None:
             return None
         return (float(self.x0) + float(self.x1)) / 2.0
-
-    @property
-    def center_y(self) -> float | None:
-        if self.y0 is None or self.y1 is None:
-            return None
-        return (float(self.y0) + float(self.y1)) / 2.0
 
 
 def _fetch_blocks(repo, document_id: str) -> list[LayoutBlock]:
@@ -62,8 +40,8 @@ def _fetch_blocks(repo, document_id: str) -> list[LayoutBlock]:
                 b.y0,
                 b.x1,
                 b.y1,
-                p.width as page_width,
-                p.height as page_height
+                p.width,
+                p.height
             from du_blocks b
             left join du_pages p
               on p.document_id = b.document_id
@@ -75,21 +53,7 @@ def _fetch_blocks(repo, document_id: str) -> list[LayoutBlock]:
         )
         rows = cur.fetchall()
 
-    return [
-        LayoutBlock(
-            block_id=row[0],
-            block_index=row[1],
-            page_index=row[2],
-            text=row[3] or "",
-            x0=row[4],
-            y0=row[5],
-            x1=row[6],
-            y1=row[7],
-            page_width=row[8],
-            page_height=row[9],
-        )
-        for row in rows
-    ]
+    return [LayoutBlock(*row) for row in rows]
 
 
 def _group_by_page(blocks: list[LayoutBlock]) -> dict[int, list[LayoutBlock]]:
@@ -104,11 +68,6 @@ def _fallback_column_assignment(page_blocks: list[LayoutBlock]) -> dict[str, int
 
 
 def _detect_columns_for_page(page_blocks: list[LayoutBlock]) -> dict[str, int]:
-    """
-    Cheap but robust 1/2-column detector.
-
-    Uses x-center gaps on a page. If geometry is missing, falls back to one column.
-    """
     usable = [b for b in page_blocks if b.center_x is not None]
     if len(usable) < 3:
         return _fallback_column_assignment(page_blocks)
@@ -120,10 +79,7 @@ def _detect_columns_for_page(page_blocks: list[LayoutBlock]) -> dict[str, int]:
     if page_width is None or page_width <= 0:
         return _fallback_column_assignment(page_blocks)
 
-    gaps: list[float] = []
-    for i in range(1, len(centers)):
-        gaps.append(centers[i] - centers[i - 1])
-
+    gaps = [centers[i] - centers[i - 1] for i in range(1, len(centers))]
     if not gaps:
         return _fallback_column_assignment(page_blocks)
 
@@ -144,99 +100,32 @@ def _detect_columns_for_page(page_blocks: list[LayoutBlock]) -> dict[str, int]:
         mapping[b.block_id] = 0
     for b in right_blocks:
         mapping[b.block_id] = 1
-
     for b in page_blocks:
         mapping.setdefault(b.block_id, 0)
-
     return mapping
 
 
-def _column_block_sort_key(block: LayoutBlock) -> tuple[float, int]:
+def _sort_key(block: LayoutBlock) -> tuple[float, int]:
     if block.y0 is not None:
         return (float(block.y0), block.block_index)
     return (float(block.block_index), block.block_index)
 
 
-def _compute_page_reading_order(
-    page_blocks: list[LayoutBlock],
-    column_map: dict[str, int],
-) -> list[LayoutBlock]:
-    """
-    Reading order:
-    column 0 top→bottom, then column 1 top→bottom.
-    """
+def _compute_page_reading_order(page_blocks: list[LayoutBlock], column_map: dict[str, int]) -> list[LayoutBlock]:
     grouped: dict[int, list[LayoutBlock]] = defaultdict(list)
-    for b in page_blocks:
-        grouped[column_map.get(b.block_id, 0)].append(b)
+    for block in page_blocks:
+        grouped[column_map.get(block.block_id, 0)].append(block)
 
     ordered: list[LayoutBlock] = []
     for column_index in sorted(grouped.keys()):
-        ordered.extend(sorted(grouped[column_index], key=_column_block_sort_key))
+        ordered.extend(sorted(grouped[column_index], key=_sort_key))
     return ordered
 
 
-def _normalized_text(text: str) -> str:
-    return " ".join((text or "").split()).strip().lower()
-
-
-def _collect_repeated_header_footer_hints(
-    pages: dict[int, list[LayoutBlock]],
-) -> dict[str, bool]:
-    """
-    Mark very likely repeated header/footer lines across pages.
-    """
-    counts: Counter[tuple[str, str]] = Counter()
-    bands: dict[str, str] = {}
-
-    for _page_index, page_blocks in pages.items():
-        for b in page_blocks:
-            page_height = b.page_height
-            y0 = b.y0
-            y1 = b.y1
-            text = _normalized_text(b.text)
-
-            if (
-                page_height is None
-                or y0 is None
-                or y1 is None
-                or len(text) < REPEAT_TEXT_MIN_LEN
-            ):
-                continue
-
-            top_band = float(page_height) * HEADER_BAND_RATIO
-            bottom_band = float(page_height) * (1.0 - FOOTER_BAND_RATIO)
-
-            band = None
-            if float(y1) <= top_band:
-                band = "header"
-            elif float(y0) >= bottom_band:
-                band = "footer"
-
-            if band is None:
-                continue
-
-            key = (band, text)
-            counts[key] += 1
-            bands[b.block_id] = band + "|" + text
-
-    repeated: dict[str, bool] = {}
-    for page_blocks in pages.values():
-        for b in page_blocks:
-            sig = bands.get(b.block_id)
-            if sig is None:
-                repeated[b.block_id] = False
-                continue
-            band, text = sig.split("|", 1)
-            repeated[b.block_id] = counts[(band, text)] >= 2
-
-    return repeated
-
-
-def _persist_geometry_column_hints(
-    repo,
-    column_hints: dict[str, int],
-) -> None:
+def _persist_geometry_column_hints(repo, column_hints: dict[str, int]) -> None:
     rows = [(block_id, float(column_index)) for block_id, column_index in column_hints.items()]
+    if not rows:
+        return
 
     with repo.conn.cursor() as cur:
         cur.executemany(
@@ -252,10 +141,7 @@ def _persist_geometry_column_hints(
     repo.conn.commit()
 
 
-def _persist_topology(
-    repo,
-    topology_rows: list[tuple],
-) -> None:
+def _persist_topology(repo, topology_rows: list[tuple]) -> None:
     if not topology_rows:
         return
 
@@ -274,7 +160,7 @@ def _persist_topology(
                 after_toc_candidate,
                 repeated_header_footer_hint
             )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, false)
             on conflict (block_id) do update
             set
                 prev_block_index = excluded.prev_block_index,
@@ -285,7 +171,8 @@ def _persist_topology(
                 is_last_on_page = excluded.is_last_on_page,
                 before_first_running_text = excluded.before_first_running_text,
                 after_toc_candidate = excluded.after_toc_candidate,
-                repeated_header_footer_hint = excluded.repeated_header_footer_hint
+                repeated_header_footer_hint = false,
+                updated_at = now()
             """,
             topology_rows,
         )
@@ -293,29 +180,17 @@ def _persist_topology(
 
 
 def compute_layout_graph(repo, document_id: str) -> None:
-    """
-    Compute:
-    - page-wise columns
-    - page reading order
-    - repeated header/footer hints
-
-    Persists results into existing DU tables:
-    - du_block_geometry.column_hint
-    - du_block_topology.*
-    """
     blocks = _fetch_blocks(repo, document_id)
     if not blocks:
         return
 
     pages = _group_by_page(blocks)
-    repeated_header_footer_hint = _collect_repeated_header_footer_hints(pages)
 
     all_column_hints: dict[str, int] = {}
     topology_rows: list[tuple] = []
-
     cluster_id_counter = 0
 
-    for _page_index, page_blocks in pages.items():
+    for _, page_blocks in pages.items():
         column_map = _detect_columns_for_page(page_blocks)
         all_column_hints.update(column_map)
 
@@ -336,7 +211,6 @@ def compute_layout_graph(repo, document_id: str) -> None:
                     i == len(ordered) - 1,
                     i == 0,
                     False,
-                    repeated_header_footer_hint.get(block.block_id, False),
                 )
             )
 

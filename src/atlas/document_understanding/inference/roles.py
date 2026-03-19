@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from atlas.document_understanding.inference.early_meta import detect_early_meta_signals
 
-
 ROLE_TITLE = "title"
 ROLE_AUTHOR = "author"
 ROLE_HEADING = "heading"
 ROLE_BODY = "body"
 ROLE_REFERENCE = "reference"
 ROLE_CAPTION = "caption"
-ROLE_HEADER = "header"
-ROLE_FOOTER = "footer"
 ROLE_NOISE = "noise"
+ROLE_PAGE_FURNITURE = "page_furniture"
+ROLE_FRONT_MATTER = "front_matter"
 
 
 def _word_count(text: str) -> int:
@@ -19,523 +18,338 @@ def _word_count(text: str) -> int:
 
 
 def _caps_ratio(text: str) -> float:
+    if not text:
+        return 0.0
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return 0.0
-    return sum(1 for c in letters if c.isupper()) / len(letters)
-
-
-def _function_word_count(text: str) -> int:
-    low = " ".join((text or "").strip().split()).lower()
-    if not low:
-        return 0
-
-    function_words = {
-        "the", "a", "an", "and", "or", "but", "of", "in", "on", "at", "for", "to",
-        "from", "with", "by", "as", "that", "this", "these", "those", "is", "are",
-        "was", "were", "be", "being", "been", "it", "its", "their", "his", "her",
-        "they", "we", "our", "also", "about", "into", "than", "then", "which",
-        "who", "while", "because", "under", "over", "after", "before", "between",
-        "through", "during", "around", "just", "some", "more",
-    }
-    return sum(1 for token in low.split() if token in function_words)
+    uppers = sum(1 for c in letters if c.isupper())
+    return uppers / len(letters)
 
 
 def _looks_sentence_like(text: str) -> bool:
-    value = " ".join((text or "").strip().split())
+    value = " ".join((text or "").split()).strip()
     if not value:
         return False
-
-    wc = _word_count(value)
-    if wc >= 12:
-        return True
-    if value.endswith((".", "!", "?")) and wc >= 6:
-        return True
-    if "," in value and wc >= 6:
-        return True
-    return False
+    if _word_count(value) < 6:
+        return False
+    return value.endswith(".") or value.endswith(";") or value.endswith(":")
 
 
 def _looks_like_author_line(text: str) -> bool:
-    value = " ".join((text or "").strip().split())
-    if not value:
-        return False
-
-    low = value.lower()
-
-    blocked = (
-        "doi:",
-        "doi.org",
-        "vol.",
-        "volume",
-        "issue",
-        "issn",
-        "figure ",
-        "table ",
-        "copyright",
-        "©",
-        "abstract",
-        "keywords",
-        "references",
-        "bibliography",
-        "journal",
-    )
-    if any(marker in low for marker in blocked):
-        return False
-
-    if "@" in value:
-        return False
-
-    words = [w.strip(",;:.()[]") for w in value.replace("&", " ").replace(" and ", " ").split()]
-    words = [w for w in words if w]
-
-    if not (2 <= len(words) <= 8):
-        return False
-
-    alpha_words = [w for w in words if any(ch.isalpha() for ch in w)]
-    if len(alpha_words) < 2:
-        return False
-
-    titlecase_like = 0
-    for word in alpha_words:
-        if len(word) == 1 and word.isupper():
-            titlecase_like += 1
-            continue
-        if word[:1].isupper():
-            titlecase_like += 1
-
-    return titlecase_like >= max(2, len(alpha_words) - 1)
-
-
-def _is_referenceish_text(text: str) -> bool:
-    low = " ".join((text or "").strip().split()).lower()
-    if not low:
-        return False
-
-    markers = (
-        "(eds",
-        "(ed.",
-        "journal",
-        "press",
-        "university press",
-        "council for british archaeology",
-        "vol.",
-        "pp.",
-        "doi:",
-        "retrieved",
-        "available at",
-        "bibliography",
-        "references",
-        "va ",
-    )
-    if any(marker in low for marker in markers):
-        return True
-
-    if low.count("(") >= 1 and low.count(")") >= 1 and any(ch.isdigit() for ch in low):
-        return True
-
-    return False
-
-
-def _looks_caption(text: str) -> bool:
-    low = text.lower().strip()
-    return low.startswith("figure ") or low.startswith("fig. ") or low.startswith("table ")
-
-
-def _looks_journal_header(text: str) -> bool:
-    low = " ".join((text or "").strip().split()).lower()
-    if not low:
-        return False
-
-    if "doi:" in low or "doi.org" in low:
-        return True
-
-    if any(marker in low for marker in ("journal", "vol.", "volume", "issue", "issn", "pp.")):
-        return True
-
-    if "vernacular architecture" in low:
-        return True
-
-    return False
-
-
-def _looks_strong_title_line(text: str) -> bool:
-    value = " ".join((text or "").strip().split())
+    value = " ".join((text or "").split()).strip()
     if not value:
         return False
 
     wc = _word_count(value)
-    if wc < 2 or wc > 18:
+    if wc < 2 or wc > 8:
         return False
 
     low = value.lower()
-    blocked = (
-        "doi:",
-        "doi.org",
+    bad_markers = (
+        "university",
+        "universität",
+        "faculty",
+        "department",
+        "institute",
         "journal",
         "vol.",
         "volume",
         "issue",
-        "issn",
-        "isbn",
+        "no.",
         "abstract",
-        "keywords",
-        "references",
-        "bibliography",
-        "figure ",
-        "table ",
-        "copyright",
-        "©",
+        "summary",
+        "eingereicht",
+        "submitted",
+        "accepted",
+        "doi",
+        "@",
     )
-    if any(marker in low for marker in blocked):
+    if any(marker in low for marker in bad_markers):
+        return False
+
+    alpha_words = []
+    for w in value.split():
+        w = w.strip(",;:.()[]")
+        if any(ch.isalpha() for ch in w):
+            alpha_words.append(w)
+
+    if len(alpha_words) < 2:
+        return False
+
+    uppercase_initials = 0
+    for w in alpha_words:
+        if w and w[0].isupper():
+            uppercase_initials += 1
+
+    return uppercase_initials >= max(2, len(alpha_words) - 1)
+
+
+def _looks_journal_header(text: str) -> bool:
+    low = " ".join((text or "").split()).lower()
+    if not low:
+        return False
+    markers = (
+        "journal",
+        "review",
+        "vol.",
+        "volume",
+        "issue",
+        "no.",
+        "issn",
+        "doi",
+        "copyright",
+        "published by",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _looks_strong_title_line(text: str) -> bool:
+    value = " ".join((text or "").split()).strip()
+    if not value:
+        return False
+
+    wc = _word_count(value)
+    if wc < 3 or wc > 20:
         return False
 
     if _looks_sentence_like(value):
         return False
 
-    if value.endswith(":"):
+    if value.endswith("."):
         return False
 
-    if _caps_ratio(value) >= 0.72 and wc >= 2:
+    caps = _caps_ratio(value)
+    if value.istitle():
         return True
-
-    if wc <= 10 and value.istitle():
+    if 0.15 <= caps <= 0.95:
         return True
-
     return False
 
 
-def _looks_heading_candidate(
-    text: str,
-    heading_like: float,
-    body_like: float,
-    reference_like: float,
-) -> bool:
-    value = " ".join((text or "").strip().split())
-    if not value:
+def _looks_caption(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
         return False
-
-    wc = _word_count(value)
-    func_wc = _function_word_count(value)
-    caps = _caps_ratio(value)
-    sentence_like = _looks_sentence_like(value)
-    referenceish = _is_referenceish_text(value)
-
-    if referenceish:
-        return False
-
-    if sentence_like:
-        return False
-
-    if wc > 18:
-        return False
-
-    # extra negative for this exact recurring false-heading pattern family
-    low = value.lower()
-    if any(
-        phrase in low
-        for phrase in (
-            "this gets some backing",
-            "striking results can be given here",
-            "one-bay open hall",
-            "buildings dated, all but two",
-            "it can hardly be",
-        )
-    ):
-        return False
-
-    if value.endswith(":") and wc <= 14 and body_like <= 0.55:
-        return True
-
-    if caps >= 0.70 and wc <= 14 and body_like <= 0.55:
-        return True
-
-    if heading_like < 0.72:
-        return False
-
-    if body_like > 0.34:
-        return False
-
-    if reference_like > 0.40:
-        return False
-
-    if func_wc >= 3:
-        return False
-
-    if "," in value and wc >= 5:
-        return False
-
-    if "." in value and not value.endswith(":"):
-        return False
-
-    return True
+    return (
+        low.startswith("figure ")
+        or low.startswith("fig. ")
+        or low.startswith("fig ")
+        or low.startswith("table ")
+        or low.startswith("tab. ")
+        or low.startswith("abb. ")
+        or low.startswith("abbildung ")
+        or low.startswith("tabelle ")
+    )
 
 
-def _choose_role(
-    title_like: float,
-    heading_like: float,
-    body_like: float,
-    reference_like: float,
-    caption_like: float,
-    noise_like: float,
-    repeated_header_footer_hint: bool,
-    is_first_on_page: bool,
-    is_last_on_page: bool,
-) -> str:
-    if repeated_header_footer_hint and is_first_on_page:
-        return ROLE_HEADER
-    if repeated_header_footer_hint and is_last_on_page:
-        return ROLE_FOOTER
-
-    scores = {
-        ROLE_TITLE: title_like,
-        ROLE_HEADING: heading_like,
-        ROLE_BODY: body_like,
-        ROLE_REFERENCE: reference_like,
-        ROLE_CAPTION: caption_like,
-        ROLE_NOISE: noise_like,
-    }
-    return max(scores.items(), key=lambda item: item[1])[0]
+def _is_referenceish_text(text: str) -> bool:
+    low = (text or "").lower()
+    markers = (
+        "vol.",
+        "volume",
+        "issue",
+        "pp.",
+        "doi",
+        "editor",
+        "editors",
+        "journal",
+        "publisher",
+        "isbn",
+        "issn",
+    )
+    return any(marker in low for marker in markers)
 
 
 def _get_by_block_id(mapping: dict, raw_block_id):
-    if raw_block_id in mapping:
-        return mapping[raw_block_id]
-    sid = str(raw_block_id)
-    if sid in mapping:
-        return mapping[sid]
-    return {}
+    if raw_block_id is None:
+        return None
+    return mapping.get(str(raw_block_id))
+
+
+def _fetch_page_furniture_map(repo, document_id: str) -> dict[str, dict]:
+    cur = repo.conn.cursor()
+    cur.execute(
+        """
+        select
+            b.block_id,
+            coalesce(p.page_number_like, false) as page_number_like,
+            coalesce(p.running_header_like, false) as running_header_like,
+            coalesce(p.running_footer_like, false) as running_footer_like,
+            coalesce(p.first_page_meta_like, false) as first_page_meta_like
+        from du_blocks b
+        left join du_block_page_furniture_signals p
+            on p.block_id = b.block_id
+        where b.document_id = %s
+        """,
+        (document_id,),
+    )
+    rows = cur.fetchall()
+
+    out: dict[str, dict] = {}
+    for (
+        block_id,
+        page_number_like,
+        running_header_like,
+        running_footer_like,
+        first_page_meta_like,
+    ) in rows:
+        out[str(block_id)] = {
+            "page_number_like": bool(page_number_like),
+            "running_header_like": bool(running_header_like),
+            "running_footer_like": bool(running_footer_like),
+            "first_page_meta_like": bool(first_page_meta_like),
+        }
+    return out
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_non_negative(value: float) -> float:
+    return max(0.0, float(value))
+
+
+def _resolve_role(
+    *,
+    text: str,
+    title_score: float,
+    heading_score: float,
+    body_score: float,
+    reference_score: float,
+    caption_score: float,
+    noise_score: float,
+    furniture: dict | None,
+) -> str:
+    furniture = furniture or {}
+
+    if furniture.get("running_header_like"):
+        return ROLE_PAGE_FURNITURE
+    if furniture.get("running_footer_like"):
+        return ROLE_PAGE_FURNITURE
+    if furniture.get("page_number_like"):
+        return ROLE_PAGE_FURNITURE
+
+    if furniture.get("first_page_meta_like"):
+        if title_score >= max(heading_score, body_score, 0.55) and _looks_strong_title_line(text):
+            return ROLE_TITLE
+        if _looks_like_author_line(text):
+            return ROLE_AUTHOR
+        if _looks_journal_header(text):
+            return ROLE_FRONT_MATTER
+
+    if caption_score >= max(reference_score, heading_score, body_score, title_score, noise_score):
+        return ROLE_CAPTION
+
+    if reference_score >= max(heading_score, body_score, title_score, noise_score):
+        return ROLE_REFERENCE
+
+    if title_score >= max(heading_score, body_score, noise_score) and _looks_strong_title_line(text):
+        return ROLE_TITLE
+
+    if heading_score >= max(body_score, noise_score, 0.0):
+        return ROLE_HEADING
+
+    if noise_score >= max(body_score, 0.85):
+        return ROLE_NOISE
+
+    if not text.strip():
+        return ROLE_NOISE
+
+    return ROLE_BODY
 
 
 def compute_roles(repo, document_id: str) -> None:
-    print(f"compute_roles entered {document_id}")
-
-    signals = repo.fetch_block_signals(document_id)
-    print(f"signals type: {type(signals)}")
-    print(f"signals len: {len(signals)}")
-    print(f"roles signals: {len(signals)}")
-
     blocks = repo.fetch_blocks(document_id)
-
-    topo_map: dict[object, dict] = {}
-    with repo.conn.cursor() as cur:
-        cur.execute(
-            """
-            select
-                block_id,
-                is_first_on_page,
-                is_last_on_page,
-                repeated_header_footer_hint,
-                early_block_rank,
-                before_first_running_text,
-                after_toc_candidate
-            from du_block_topology
-            where block_id in (
-                select block_id
-                from du_blocks
-                where document_id = %s
-            )
-            """,
-            (document_id,),
-        )
-        cols = [desc[0] for desc in cur.description]
-        for row in cur.fetchall():
-            data = dict(zip(cols, row))
-            topo_map[data["block_id"]] = data
-            topo_map[str(data["block_id"])] = data
-
+    signals = repo.fetch_block_signals(document_id)
+    furniture_map = _fetch_page_furniture_map(repo, document_id)
     early_meta = detect_early_meta_signals(blocks, limit=10)
-    strong_journal_header = bool(early_meta["strong_journal_header"])
-    very_strong_journal_header = bool(early_meta["very_strong_journal_header"])
-    strong_thesis_header = bool(early_meta["strong_thesis_header"])
 
-    rows: list[dict] = []
+    rows = []
 
     for block in blocks:
-        raw_block_id = block.get("block_id")
+        block_id = str(block.get("block_id"))
         text = (block.get("text") or "").strip()
         low = text.lower()
 
-        sig = _get_by_block_id(signals, raw_block_id) or {}
-        topo = _get_by_block_id(topo_map, raw_block_id) or {}
+        sig = _get_by_block_id(signals, block_id) or {}
+        furniture = furniture_map.get(block_id) or {}
 
-        title_like = float(sig.get("title_like") or 0.0)
-        heading_like = float(sig.get("heading_like") or 0.0)
-        body_like = float(sig.get("running_text_like") or 0.0)
-        reference_like = float(sig.get("reference_like") or 0.0)
-        caption_like = float(sig.get("caption_like") or 0.0)
-        noise_like = float(sig.get("noise_like") or 0.0)
-        author_like = float(sig.get("author_like") or 0.0)
+        title_score = _safe_float(sig.get("title_like"))
+        heading_score = _safe_float(sig.get("heading_like"))
+        body_score = _safe_float(sig.get("body_like"))
+        reference_score = _safe_float(sig.get("reference_like"))
+        caption_score = _safe_float(sig.get("caption_like"))
+        noise_score = _safe_float(sig.get("noise_like"))
 
-        is_first_on_page = bool(topo.get("is_first_on_page") or False)
-        is_last_on_page = bool(topo.get("is_last_on_page") or False)
-        repeated_header_footer_hint = bool(topo.get("repeated_header_footer_hint") or False)
-        early_block_rank = int(topo.get("early_block_rank") or 999999)
-        after_toc_candidate = bool(topo.get("after_toc_candidate") or False)
+        if furniture.get("first_page_meta_like"):
+            title_score += 0.12
+            body_score *= 0.85
 
-        word_count = _word_count(text)
-        sentence_like = _looks_sentence_like(text)
-        referenceish_text = _is_referenceish_text(text)
+            if _looks_like_author_line(text):
+                heading_score *= 0.70
+                body_score *= 0.75
 
-        is_very_early = early_block_rank <= 8
-        is_early_title_window = early_block_rank <= 12
+        if furniture.get("running_header_like") or furniture.get("running_footer_like") or furniture.get("page_number_like"):
+            noise_score = max(noise_score, 0.90)
+            title_score *= 0.10
+            heading_score *= 0.10
+            body_score *= 0.10
+            reference_score *= 0.10
+            caption_score *= 0.10
 
-        is_doi_meta = "doi:" in low or "doi.org" in low
-        is_journal_meta = _looks_journal_header(text)
-        is_copyrightish = "©" in text or "copyright" in low
-        is_abstract_marker = low in {"abstract"} or low.startswith("abstract ")
-        is_keywords_marker = low in {"keywords"} or low.startswith("keywords")
-        is_reference_heading = low in {"references", "bibliography"} or low.startswith("references ")
-        is_captionish_text = low.startswith("figure ") or low.startswith("fig. ") or low.startswith("table ")
-
-        role = None
-
-        if repeated_header_footer_hint and is_first_on_page:
-            role = ROLE_HEADER
-        elif repeated_header_footer_hint and is_last_on_page:
-            role = ROLE_FOOTER
-
-        elif is_very_early and is_doi_meta:
-            reference_like = 0.0
-            body_like = min(body_like, 0.15)
-            title_like = min(title_like, 0.10)
-            heading_like = min(heading_like, 0.10)
-            role = ROLE_HEADER
-
-        elif is_very_early and is_journal_meta and (strong_journal_header or very_strong_journal_header):
-            reference_like = 0.0
-            body_like = min(body_like, 0.15)
-            title_like = min(title_like, 0.10)
-            heading_like = min(heading_like, 0.10)
-            role = ROLE_HEADER
-
-        elif is_very_early and is_copyrightish and (strong_journal_header or very_strong_journal_header):
-            reference_like = 0.0
-            body_like = min(body_like, 0.20)
-            role = ROLE_HEADER
-
-        elif is_very_early and strong_thesis_header:
-            thesis_metaish = any(
-                marker in low
-                for marker in (
-                    "university",
-                    "faculty",
-                    "department",
-                    "submitted to",
-                    "for the degree of",
-                    "doctoral thesis",
-                    "dissertation",
-                    "master thesis",
-                    "masterarbeit",
-                    "doktorarbeit",
-                    "habilitationsschrift",
-                    "zur erlangung",
-                )
-            )
-            if thesis_metaish:
-                reference_like = 0.0
-                body_like = min(body_like, 0.20)
-                if author_like >= 0.55 or _looks_like_author_line(text):
-                    role = ROLE_AUTHOR
-                else:
-                    role = ROLE_HEADER
-
-        if role is None and caption_like >= 0.55:
-            if caption_like >= max(title_like, heading_like, body_like, reference_like):
-                role = ROLE_CAPTION
-
-        if role is None and is_captionish_text and word_count <= 40:
-            role = ROLE_CAPTION
-
-        if role is None and is_reference_heading:
-            role = ROLE_HEADING
-
-        if role is None and (is_abstract_marker or is_keywords_marker):
-            role = ROLE_HEADING
-
-        if role is None and is_early_title_window:
-            if _looks_strong_title_line(text):
-                role = ROLE_TITLE
-
-        if role is None and is_early_title_window:
-            if (
-                (author_like >= 0.58 or _looks_like_author_line(text))
-                and not is_doi_meta
-                and not is_journal_meta
-                and not is_reference_heading
-                and not referenceish_text
-                and not _looks_strong_title_line(text)
-            ):
-                role = ROLE_AUTHOR
-
-        if role is None:
-            if is_very_early and (very_strong_journal_header or strong_journal_header):
-                if is_doi_meta or is_journal_meta:
-                    reference_like = 0.0
-
-        if role is None and reference_like >= 0.62:
-            if (
-                not is_doi_meta
-                and not (is_very_early and is_journal_meta)
-                and (referenceish_text or after_toc_candidate or reference_like > body_like + 0.18)
-            ):
-                role = ROLE_REFERENCE
-
-        if role is None:
-            if _looks_heading_candidate(
-                text=text,
-                heading_like=heading_like,
-                body_like=body_like,
-                reference_like=reference_like,
-            ):
-                role = ROLE_HEADING
-
-        if role is None:
-            if sentence_like:
-                role = ROLE_BODY
-            elif body_like >= max(title_like, heading_like, reference_like, caption_like, noise_like):
-                role = ROLE_BODY
-            elif word_count >= 14:
-                role = ROLE_BODY
-
-        if role is None:
-            if not is_early_title_window:
-                title_like = min(title_like, 0.15)
-
-            if sentence_like:
-                heading_like = min(heading_like, 0.15)
-
-            chosen = _choose_role(
-                title_like=title_like,
-                heading_like=heading_like,
-                body_like=body_like,
-                reference_like=reference_like,
-                caption_like=caption_like,
-                noise_like=noise_like,
-                repeated_header_footer_hint=repeated_header_footer_hint,
-                is_first_on_page=is_first_on_page,
-                is_last_on_page=is_last_on_page,
-            )
-
-            if chosen == ROLE_TITLE and not is_early_title_window:
-                role = ROLE_BODY
-            elif chosen == ROLE_HEADING and sentence_like:
-                role = ROLE_BODY
+        if early_meta.get("has_journal_meta") and _looks_journal_header(text):
+            if furniture.get("first_page_meta_like"):
+                title_score += 0.05
             else:
-                role = chosen
+                reference_score += 0.05
 
-        row = {
-            "block_id": raw_block_id,
-            "role": role,
-            "title_score": title_like,
-            "heading_score": heading_like,
-            "body_score": body_like,
-            "reference_score": reference_like,
-            "caption_score": caption_like,
-            "noise_score": noise_like,
-        }
-        rows.append(row)
+        if _looks_caption(text):
+            caption_score += 0.20
+            body_score *= 0.90
 
-    print(f"roles rows: {len(rows)}")
-    print(f"roles sample: {rows[:3]}")
+        if _is_referenceish_text(text):
+            reference_score += 0.10
+
+        if low in {"references", "bibliography", "literatur", "literaturverzeichnis"}:
+            heading_score += 0.15
+            reference_score += 0.20
+
+        title_score = _clamp_non_negative(title_score)
+        heading_score = _clamp_non_negative(heading_score)
+        body_score = _clamp_non_negative(body_score)
+        reference_score = _clamp_non_negative(reference_score)
+        caption_score = _clamp_non_negative(caption_score)
+        noise_score = _clamp_non_negative(noise_score)
+
+        role = _resolve_role(
+            text=text,
+            title_score=title_score,
+            heading_score=heading_score,
+            body_score=body_score,
+            reference_score=reference_score,
+            caption_score=caption_score,
+            noise_score=noise_score,
+            furniture=furniture,
+        )
+
+        rows.append(
+            {
+                "block_id": block_id,
+                "role": role,
+                "title_score": title_score,
+                "heading_score": heading_score,
+                "body_score": body_score,
+                "reference_score": reference_score,
+                "caption_score": caption_score,
+                "noise_score": noise_score,
+            }
+        )
+
     repo.store_block_roles(document_id, rows)
