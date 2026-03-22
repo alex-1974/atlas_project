@@ -11,6 +11,7 @@ from atlas.db.connection import get_connection
 from atlas.db.migrate import run_migrations
 
 from atlas.document_understanding.inference.consensus import compute_consensus
+from atlas.document_understanding.inference.headings import compute_headings
 from atlas.document_understanding.inference.document_type import compute_document_type
 from atlas.document_understanding.inference.roles import compute_roles
 from atlas.document_understanding.inference.semantic_zones import compute_semantic_zones
@@ -160,6 +161,7 @@ def _du_process_document(doc_id: str) -> None:
         compute_signals(repo, doc_id)
         compute_roles(repo, doc_id)
         compute_consensus(repo, doc_id)
+        compute_headings(repo, doc_id)
         compute_document_phase(repo, doc_id)
         compute_zone_hypotheses(repo, doc_id)
         compute_zone_memberships(repo, doc_id)

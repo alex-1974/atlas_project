@@ -1,222 +1,247 @@
+# src/atlas/document_understanding/layers/section_tree.py
 from __future__ import annotations
 
-import re
+from typing import Any
+
+from atlas.document_understanding.core.heading_normalization import (
+    is_appendix_heading,
+    is_reference_heading,
+    normalize_headings,
+)
 
 
-def _normalize(text: str) -> str:
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except:
+        return default
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except:
+        return default
+
+
+def _norm(text: str | None) -> str:
     return " ".join((text or "").split()).strip()
 
 
-def _normalize_title(text: str | None) -> str | None:
-    if text is None:
-        return None
-    value = _normalize(text).lower()
-    return value or None
+# ---------------------------------------------------------
+# Candidate Expansion (bestehend)
+# ---------------------------------------------------------
+
+def _estimate_body_font(blocks: list[dict]) -> float:
+    sizes = [_safe_float(b.get("font_size")) for b in blocks if b.get("font_size")]
+    if not sizes:
+        return 10.0
+    sizes = sorted(sizes)
+    return sizes[len(sizes) // 2]
 
 
-def _extract_section_number(text: str | None) -> tuple[str | None, bool]:
-    value = _normalize(text or "")
-    if not value:
-        return None, False
+def _is_typographic_heading(b: dict, body_font: float) -> bool:
+    size = _safe_float(b.get("font_size"))
+    italic = bool(b.get("italic"))
+    text = _norm(b.get("text"))
 
-    m = re.match(r"^((?:\d+\.)*\d+)\s+.+$", value)
-    if m:
-        return m.group(1), True
-
-    m = re.match(r"^((?:\d+\.)+\d+)\.?\s*$", value)
-    if m:
-        return m.group(1), True
-
-    return None, False
-
-
-def _word_count(text: str) -> int:
-    return len((text or "").split())
-
-
-def _caps_ratio(text: str) -> float:
-    letters = [c for c in (text or "") if c.isalpha()]
-    if not letters:
-        return 0.0
-    return sum(1 for c in letters if c.isupper()) / len(letters)
-
-
-def _looks_sentence_like(text: str) -> bool:
-    value = _normalize(text)
-    if not value:
-        return False
-    if _word_count(value) < 6:
-        return False
-    return value.endswith(".") or value.endswith(";") or value.endswith(":")
-
-
-def _looks_reference_heading(text: str) -> bool:
-    value = _normalize(text).lower()
-    return value in {
-        "references",
-        "bibliography",
-        "works cited",
-        "literatur",
-        "literaturverzeichnis",
-        "quellen",
-    }
-
-
-def _is_heading_candidate(text: str) -> bool:
-    value = _normalize(text)
-    if not value:
+    if not text:
         return False
 
-    wc = _word_count(value)
-    if wc == 0 or wc > 18:
-        return False
-
-    if _looks_sentence_like(value):
-        return False
-
-    if value.endswith("."):
-        return False
-
-    caps = _caps_ratio(value)
-    if value.istitle() and wc <= 12:
+    if size >= body_font + 1.5:
         return True
-    if caps >= 0.55 and wc <= 12:
+
+    if italic and len(text.split()) <= 5 and size >= body_font - 0.2:
         return True
-    return wc <= 8
+
+    return False
 
 
-def _infer_level(text: str, is_numbered: bool, section_number: str | None) -> int:
-    if is_numbered and section_number:
-        return min(section_number.count(".") + 1, 6)
+def _is_score_heading(b: dict) -> bool:
+    heading = _safe_float(b.get("heading_score"))
+    body = _safe_float(b.get("body_score"))
+    noise = _safe_float(b.get("noise_score"))
+    caption = _safe_float(b.get("caption_score"))
+    reference = _safe_float(b.get("reference_score"))
 
-    value = _normalize(text)
-    wc = _word_count(value)
-    caps = _caps_ratio(value)
-
-    if wc <= 5 and (value.istitle() or caps > 0.60):
-        return 1
-    if wc <= 10:
-        return 2
-    return 3
+    return heading >= 0.35 and heading > body and heading > noise and heading > caption and heading > reference
 
 
-def _fetch_phase_map(repo, document_id: str) -> dict[str, str]:
-    cur = repo.conn.cursor()
-    cur.execute(
-        """
-        select
-            b.block_id,
-            case
-                when coalesce(c.front_matter_score, 0.0) >= greatest(
-                    coalesce(c.body_score, 0.0),
-                    coalesce(c.back_matter_score, 0.0)
-                ) then 'front_matter'
-                when coalesce(c.back_matter_score, 0.0) >= greatest(
-                    coalesce(c.front_matter_score, 0.0),
-                    coalesce(c.body_score, 0.0)
-                ) then 'back_matter'
-                else 'body'
-            end as phase
-        from du_blocks b
-        left join du_block_context c
-            on c.block_id = b.block_id
-        where b.document_id = %s
-        """,
-        (document_id,),
+def _collect_heading_candidates(blocks: list[dict]) -> list[dict]:
+    body_font = _estimate_body_font(blocks)
+
+    candidates = []
+
+    for b in blocks:
+        role = (b.get("role") or "").lower()
+
+        if role == "heading":
+            candidates.append(b)
+            continue
+
+        if _is_score_heading(b):
+            candidates.append(b)
+            continue
+
+        if _is_typographic_heading(b, body_font):
+            candidates.append(b)
+            continue
+
+    return candidates
+
+
+# ---------------------------------------------------------
+# Style Model
+# ---------------------------------------------------------
+
+def _style_key(h: dict[str, Any]) -> tuple:
+    return (
+        round(_safe_float(h.get("font_size")), 1),
+        bool(h.get("italic")),
     )
-    rows = cur.fetchall()
-    return {str(block_id): phase for block_id, phase in rows}
 
+
+def _compute_style_levels(headings: list[dict]) -> dict:
+    styles = {}
+
+    for h in headings:
+        key = _style_key(h)
+        styles.setdefault(key, []).append(h)
+
+    sorted_styles = sorted(
+        styles.keys(),
+        key=lambda k: (-k[0], k[1]),
+    )
+
+    return {style: i + 1 for i, style in enumerate(sorted_styles)}
+
+
+# ---------------------------------------------------------
+# Title Detection
+# ---------------------------------------------------------
+
+def _detect_title(headings: list[dict]) -> dict | None:
+    if not headings:
+        return None
+
+    max_font = max(_safe_float(h.get("font_size")) for h in headings)
+
+    candidates = [h for h in headings if _safe_float(h.get("font_size")) == max_font]
+    candidates.sort(key=lambda h: _safe_int(h.get("block_index")))
+
+    return candidates[0] if candidates else None
+
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
 
 def compute_section_tree(repo, document_id: str) -> None:
-    blocks = repo.fetch_blocks(document_id)
-    role_rows = repo.fetch_block_roles(document_id)
-    phase_map = _fetch_phase_map(repo, document_id)
+    blocks = repo.fetch_block_records(document_id)
 
-    role_map = {str(row["block_id"]): row for row in role_rows}
+    # -----------------------------------------------------
+    # Step 1: Candidate Expansion
+    # -----------------------------------------------------
 
-    headings = []
+    candidates = _collect_heading_candidates(blocks)
 
-    for block in blocks:
-        block_id = str(block.get("block_id"))
-        text = block.get("text") or ""
-        role_row = role_map.get(block_id) or {}
-        role = role_row.get("role")
+    raw_headings = [
+        {
+            "block_id": b.get("block_id"),
+            "block_index": b.get("block_index"),
+            "page_index": b.get("page_index"),
+            "text": b.get("text"),
+            "font_size": b.get("font_size"),
+            "italic": b.get("italic"),
+        }
+        for b in candidates
+    ]
 
-        if role == "page_furniture":
-            continue
+    print("\n--- RAW CANDIDATES ---")
+    for h in raw_headings:
+        print(h)
 
-        if phase_map.get(block_id) == "front_matter":
-            continue
+    # -----------------------------------------------------
+    # Step 2: Normalisierung
+    # -----------------------------------------------------
 
-        if role not in {"heading", "reference"} and not _is_heading_candidate(text):
-            continue
+    headings = normalize_headings(raw_headings)
 
-        section_number, is_numbered = _extract_section_number(text)
-        level = _infer_level(text, is_numbered, section_number)
+    print("\n--- NORMALIZED HEADINGS ---")
+    for h in headings:
+        print(h)
 
-        headings.append(
-            {
-                "block_id": block_id,
-                "block_index": int(block.get("block_index") or 0),
-                "page": block.get("page_index"),
-                "title": _normalize(text),
-                "title_norm": _normalize_title(text),
-                "level": level,
-                "phase": phase_map.get(block_id),
-                "is_reference_heading": _looks_reference_heading(text),
-                "section_number": section_number,
-                "is_numbered": is_numbered,
-                "role": "reference" if role == "reference" else "heading",
-            }
-        )
+    if not headings:
+        repo.store_section_tree(document_id, [])
+        return
 
-    headings.sort(key=lambda h: h["block_index"])
+    # -----------------------------------------------------
+    # Step 3: Titel erkennen & entfernen
+    # -----------------------------------------------------
 
-    nodes = []
-    stack: list[dict] = []
+    title = _detect_title(headings)
 
-    max_block_index = max(
-        [int(b.get("block_index") or 0) for b in blocks],
-        default=0,
-    )
+    structural_headings = [
+        h for h in headings if h is not title
+    ]
 
-    next_node_id = 1
+    # -----------------------------------------------------
+    # Step 4: Level Mapping
+    # -----------------------------------------------------
 
-    for idx, heading in enumerate(headings):
-        while stack and stack[-1]["level"] >= heading["level"]:
+    style_levels = _compute_style_levels(structural_headings)
+
+    # -----------------------------------------------------
+    # Step 5: Tree bauen (stabil)
+    # -----------------------------------------------------
+
+    rows = []
+    stack = []
+    node_id = 1
+
+    for i, h in enumerate(structural_headings):
+        text = _norm(h.get("text"))
+
+        level = style_levels[_style_key(h)]
+
+        # harte strukturelle Korrektur (generisch!)
+        if is_reference_heading(text) or is_appendix_heading(text):
+            level = 1
+
+        block_index = _safe_int(h.get("block_index"))
+        end_block = _safe_int(h.get("end_block_index"), block_index)
+
+        title_text = text or f"Section {i+1}"
+
+        while stack and stack[-1]["level"] >= level:
             stack.pop()
 
-        parent = stack[-1] if stack else None
-        next_block_index = (
-            headings[idx + 1]["block_index"] if idx + 1 < len(headings) else None
-        )
-
-        start_block_index = heading["block_index"]
-        end_block_index = (
-            next_block_index - 1 if next_block_index is not None else max_block_index
-        )
+        parent_id = stack[-1]["section_node_id"] if stack else None
 
         node = {
-            "node_id": next_node_id,
-            "parent_id": parent["node_id"] if parent else None,
-            "heading_block_id": heading["block_id"],
-            "start_block_index": start_block_index,
-            "end_block_index": end_block_index,
-            "page_start": heading["page"],
-            "page_end": heading["page"],
-            "level": heading["level"],
-            "role": heading["role"],
-            "section_number": heading["section_number"],
-            "title": heading["title"],
-            "title_normalized": heading["title_norm"],
-            "is_numbered": heading["is_numbered"],
-            "confidence": 0.8,
-            "source": "du.section_tree.v2",
+            "section_node_id": node_id,
+            "parent_section_node_id": parent_id,
+            "heading_block_id": h.get("block_id"),
+            "start_block_index": block_index,
+            "end_block_index": end_block,
+            "page_start": h.get("page_index"),
+            "page_end": h.get("page_index"),
+            "level": level,
+            "role": "heading",
+            "section_number": None,
+            "title": title_text,
+            "title_normalized": title_text.lower(),
+            "is_numbered": False,
+            "confidence": None,
+            "source": "hierarchical_v1",
         }
 
-        nodes.append(node)
+        rows.append(node)
         stack.append(node)
-        next_node_id += 1
+        node_id += 1
 
-    repo.store_section_tree(document_id, nodes)
+    repo.store_section_tree(document_id, rows)

@@ -1,3 +1,13 @@
+# -----------------------------------------------------------------------------
+# LEGACY HEADING HEURISTICS
+#
+# This module is retained for older segmentation/structure workflows.
+# It is NOT the canonical heading detection logic for the current DU pipeline.
+#
+# Canonical implementation:
+#   atlas.document_understanding.core.heading
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import re
