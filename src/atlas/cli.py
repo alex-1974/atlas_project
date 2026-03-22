@@ -28,6 +28,7 @@ from atlas.document_understanding.layers.surface import compute_surface
 from atlas.document_understanding.layers.topology import compute_topology
 from atlas.document_understanding.layers.typography import compute_typography
 from atlas.document_understanding.layers.section_tree import compute_section_tree
+from atlas.document_understanding.layers.zones import compute_zones
 from atlas.document_understanding.layout.layout_clusters import compute_layout_clusters
 from atlas.document_understanding.layout.layout_graph import compute_layout_graph
 from atlas.document_understanding.persistence.repository import Repository
@@ -166,6 +167,7 @@ def _du_process_document(doc_id: str) -> None:
         compute_zone_hypotheses(repo, doc_id)
         compute_zone_memberships(repo, doc_id)
         compute_semantic_zones(repo, doc_id)
+        compute_zones(repo, doc_id)
         compute_section_tree(repo, doc_id)
         compute_document_type(repo, doc_id)
 
@@ -447,25 +449,6 @@ def du_process_all(workers: int = 4) -> None:
 
 @du_app.command("inspect")
 def du_inspect(doc_id: str, limit: int = 50, verbose: bool = True) -> None:
-    """
-    Inspect DU output with full layer visibility.
-
-    Shows:
-    - document type
-    - per-block role / phase / furniture
-    - geometry
-    - typography
-    - spacing_rhythm
-    - topology_signals
-    - surface
-    - context
-    - semantic_micro
-    - page_furniture_signals
-    - zones
-    - section tree
-    - document type top-k
-    """
-
     def _fetch_map(cur, sql: str, params: tuple) -> dict:
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]

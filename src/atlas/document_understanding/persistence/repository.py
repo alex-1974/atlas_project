@@ -5,6 +5,7 @@ from typing import Any, Iterable
 
 import psycopg
 from psycopg import sql
+from psycopg.rows import dict_row
 
 
 class Repository:
@@ -1300,3 +1301,47 @@ class Repository:
                 }
             )
         return out
+
+    def store_block_zones(self, document_id: Any, rows: list[dict[str, Any]]) -> None:
+        if not self._table_exists("du_block_zones"):
+            return
+
+        normalized = []
+        for row in rows or []:
+            block_id = row.get("block_id")
+            if not block_id:
+                continue
+            normalized.append(
+                {
+                    "block_id": block_id,
+                    "zone": row.get("zone") or "body",
+                    "zone_confidence": row.get("zone_confidence"),
+                }
+            )
+
+        self._replace_block_table(
+            "du_block_zones",
+            document_id,
+            normalized,
+            ["block_id", "zone", "zone_confidence"],
+        )
+
+    def fetch_block_zones(self, document_id: Any) -> list[dict[str, Any]]:
+        if not self._table_exists("du_block_zones"):
+            return []
+
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                select
+                    z.block_id,
+                    z.zone,
+                    z.zone_confidence
+                from du_block_zones z
+                join du_blocks b on b.block_id = z.block_id
+                where b.document_id = %s
+                order by b.block_index
+                """,
+                (document_id,),
+            )
+            return list(cur.fetchall() or [])
