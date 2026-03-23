@@ -1,45 +1,43 @@
 from __future__ import annotations
 
+import typer
+
 from atlas.db.connection import get_connection
 from atlas.enrich.title_from_text import extract_title_from_lines
+from atlas.structure.header_candidates import extract_header_candidates
 
 
-def _fmt_float(value: float | None) -> str:
-    if value is None:
+def _short(value: str | None, limit: int = 120) -> str:
+    if not value:
         return "-"
-    return f"{value:.2f}"
+    value = " ".join(str(value).split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
 
 
-def _one_line(text: str, limit: int = 140) -> str:
-    compact = " ".join(str(text).split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 1].rstrip() + "…"
+def inspect_title_candidates(
+    limit: int = 20,
+    review_only: bool = True,
+    top_k: int = 3,
+) -> None:
+    """
+    Schema-safe title candidate inspection.
 
-
-def inspect_title_candidates(limit: int = 20, review_only: bool = True, top_k: int = 3) -> None:
-    where_extra = "and coalesce(d.title_needs_review, false) = true" if review_only else ""
-    top_k = max(1, int(top_k))
+    Recomputes title candidates from source text instead of reading
+    non-existent diagnostics columns from documents.
+    """
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"""
+                """
                 select
+                    d.document_id,
                     d.relative_path,
-                    coalesce(fm.text, tp.text, e.text_full) as source_text,
-                    case
-                        when fm.text is not null then 'front_matter'
-                        when tp.text is not null then 'title_page'
-                        else 'full_text'
-                    end as source_region,
                     d.title,
                     d.title_source,
-                    d.title_score_raw,
-                    d.title_confidence,
-                    d.title_score_margin,
-                    d.title_candidate_count,
-                    d.title_needs_review
+                    coalesce(fm.text, tp.text, e.text_full) as source_text
                 from documents d
                 join lateral (
                     select text_full
@@ -67,81 +65,61 @@ def inspect_title_candidates(limit: int = 20, review_only: bool = True, top_k: i
                 ) tp on true
                 where e.text_full is not null
                   and btrim(e.text_full) <> ''
-                  {where_extra}
-                order by
-                    coalesce(d.title_needs_review, false) desc,
-                    d.title_confidence asc nulls first,
-                    d.title_score_margin asc nulls first,
-                    d.relative_path
+                order by d.relative_path
                 limit %s
                 """,
                 (limit,),
             )
             rows = cur.fetchall()
 
-    for (
-        path,
-        source_text,
-        source_region,
-        current_title,
-        current_source,
-        current_score,
-        current_confidence,
-        current_margin,
-        current_candidate_count,
-        current_review,
-    ) in rows:
-        print(path)
-        print("  stored title :", current_title if current_title else "-")
-        print("  title source :", current_source if current_source else "-")
-        print("  source region:", source_region)
-        print("  score        :", _fmt_float(current_score))
-        print("  confidence   :", _fmt_float(current_confidence))
-        print("  margin       :", _fmt_float(current_margin))
-        print("  candidates   :", current_candidate_count if current_candidate_count is not None else "-")
-        print("  review       :", bool(current_review))
+    if not rows:
+        typer.echo("no documents")
+        return
 
-        lines = str(source_text).splitlines()
-        non_empty_lines = [line for line in lines if line.strip()]
-        print("  source lines :", len(non_empty_lines))
-        print("  source preview:")
-        if non_empty_lines:
-            for preview_line in non_empty_lines[:3]:
-                print(f"    {_one_line(preview_line)}")
-        else:
-            print("    -")
+    shown = 0
 
+    for document_id, relative_path, stored_title, title_source, source_text in rows:
+        candidates = extract_header_candidates(str(source_text))
+        lines = candidates.title_lines[:40]
         result = extract_title_from_lines(lines)
 
         if not result:
-            print("  extracted    : -")
-            print("  top candidates: -")
-            print()
+            if review_only:
+                continue
+            typer.echo(relative_path)
+            typer.echo("-" * min(len(str(relative_path)), 80))
+            typer.echo("stored : " + _short(stored_title))
+            typer.echo("source : " + _short(title_source, 40))
+            typer.echo("top candidates: none")
+            typer.echo("")
+            shown += 1
             continue
 
-        print("  extracted    :", result.get("title") or "-")
-        print("  new score    :", _fmt_float(result.get("score")))
-        print("  new conf.    :", _fmt_float(result.get("confidence")))
-        print("  new margin   :", _fmt_float(result.get("margin")))
-        print("  new review   :", bool(result.get("needs_review")))
-
-        scored = result.get("scored_candidates", [])
-        if not scored:
-            print("  top candidates: -")
-            print()
+        if review_only and not bool(result["needs_review"]):
             continue
 
-        print("  top candidates:")
-        for rank, item in enumerate(scored[:top_k], start=1):
-            line_index = item.get("line_index")
-            text = item.get("text", "")
-            raw_line = "-"
-            if isinstance(line_index, int) and 0 <= line_index < len(lines):
-                raw_line = _one_line(lines[line_index], limit=100)
+        typer.echo(relative_path)
+        typer.echo("-" * min(len(str(relative_path)), 80))
+        typer.echo("stored : " + _short(stored_title))
+        typer.echo("source : " + _short(title_source, 40))
+        typer.echo(
+            f"best   : {_short(result['title'])}  "
+            f"score={result['score']:.2f}  "
+            f"conf={result['confidence']:.2f}  "
+            f"margin={result['margin']:.2f}  "
+            f"review={bool(result['needs_review'])}"
+        )
 
-            print(
-                f"    [{rank}] score={item['score']:.2f} "
-                f"line={line_index} text={text}"
+        scored_candidates = result.get("scored_candidates", [])[:top_k]
+        for i, item in enumerate(scored_candidates, start=1):
+            typer.echo(
+                f"  [{i}] score={float(item['score']):.2f} "
+                f"line={int(item['line_index'])} "
+                f"{_short(str(item['text']))}"
             )
-            print(f"         raw={raw_line}")
-        print()
+
+        typer.echo("")
+        shown += 1
+
+    if shown == 0:
+        typer.echo("no candidate rows")

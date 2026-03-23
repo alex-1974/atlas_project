@@ -1,3 +1,13 @@
+# -----------------------------------------------------------------------------
+# LEGACY HEADING HEURISTICS
+#
+# This module is retained for older segmentation/structure workflows.
+# It is NOT the canonical heading detection logic for the current DU pipeline.
+#
+# Canonical implementation:
+#   atlas.document_understanding.core.heading
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import re
@@ -15,41 +25,141 @@ REGION_MARKER_RE = re.compile(
     re.I,
 )
 
+NUMBERED_HEADING_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+){0,4}|[A-Z]|[IVXLCM]+)[\.\)]?\s+[^\s].*$"
+)
+
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.\)])\s+")
+TOC_DOTS_RE = re.compile(r"\.{3,}")
+TRAILING_PAGE_RE = re.compile(r"(?:\s|\.)(\d{1,4})\s*$")
+EMAIL_RE = re.compile(r"\b[\w.\-+]+@[\w.\-]+\.\w+\b", re.I)
 
 SENTENCE_HINT_WORDS = {
-    "the", "and", "with", "from", "that", "this", "are", "is", "was", "were",
+    "the", "and", "with", "from", "that", "this", "these", "those",
+    "are", "is", "was", "were", "be", "been", "being",
     "der", "die", "das", "und", "mit", "von", "ein", "eine", "einer",
+    "ist", "sind", "war", "waren", "dies", "diese", "dieser", "dieses",
+}
+
+AUTHORISH_LINE_RE = re.compile(
+    r"^(?:"
+    r"[A-ZÀ-ÖØ-Ý]\.\s*"
+    r"){1,3}[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+$"
+    r"|^"
+    r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+"
+    r"(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+){1,3}$"
+)
+
+LOWER_CONNECTORS = {
+    "de", "del", "der", "den", "van", "von", "zu", "zum", "zur",
+    "la", "le", "du", "des", "da", "dos", "di", "of", "and",
+    "und", "et", "y", "della", "delle", "dei",
 }
 
 
 def is_blank_line(line: str) -> bool:
-    return not line.strip()
-
-
-def is_region_marker(line: str) -> bool:
-    return bool(REGION_MARKER_RE.match((line or "").strip()))
+    return not (line or "").strip()
 
 
 def _normalize_inline_whitespace(text: str) -> str:
     return " ".join((text or "").strip().split())
 
 
-def is_heading_like(line: str) -> bool:
+def line_word_count(line: str) -> int:
+    return len(_normalize_inline_whitespace(line).split())
+
+
+def is_region_marker(line: str) -> bool:
+    return bool(REGION_MARKER_RE.match((line or "").strip()))
+
+
+def is_toc_like_line(line: str) -> bool:
     value = _normalize_inline_whitespace(line)
     if not value:
         return False
 
-    if REGION_MARKER_RE.match(value):
+    score = 0
+    if TOC_DOTS_RE.search(value):
+        score += 1
+    if TRAILING_PAGE_RE.search(value):
+        score += 1
+    if re.search(r"\b(?:contents|inhalt|inhaltsverzeichnis|table of contents|sommaire)\b", value, re.I):
+        score += 2
+
+    return score >= 2
+
+
+def is_list_like_line(line: str) -> bool:
+    value = _normalize_inline_whitespace(line)
+    if not value:
+        return False
+    return bool(LIST_MARKER_RE.match(value))
+
+
+def is_metadata_like_line(line: str) -> bool:
+    value = _normalize_inline_whitespace(line)
+    if not value:
+        return False
+
+    if EMAIL_RE.search(value):
         return True
 
-    if len(value) > 100:
+    if len(value) > 120:
         return False
 
-    if LIST_MARKER_RE.match(value):
+    words = value.split()
+    if not (1 <= len(words) <= 6):
         return False
 
-    # headings rarely end with full stop
+    if AUTHORISH_LINE_RE.match(value):
+        return True
+
+    # Mostly titlecase / initials without sentence character.
+    alpha_words = []
+    for word in words:
+        cleaned = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ.'`\-]", "", word)
+        if not cleaned:
+            continue
+        alpha_words.append(cleaned)
+
+    if not alpha_words:
+        return False
+
+    good = 0
+    for token in alpha_words:
+        low = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", token).casefold()
+        if low in LOWER_CONNECTORS:
+            good += 1
+            continue
+        if re.fullmatch(r"[A-ZÀ-ÖØ-Ý]\.", token):
+            good += 1
+            continue
+        if token[:1].isupper():
+            good += 1
+
+    return good >= max(2, len(alpha_words) - 1)
+
+
+def is_heading_like_line(line: str) -> bool:
+    value = _normalize_inline_whitespace(line)
+    if not value:
+        return False
+
+    if is_region_marker(value):
+        return True
+
+    if is_toc_like_line(value):
+        return False
+
+    if is_list_like_line(value):
+        return False
+
+    if NUMBERED_HEADING_RE.match(value):
+        return True
+
+    if len(value) > 120:
+        return False
+
     if value.endswith("."):
         return False
 
@@ -57,10 +167,11 @@ def is_heading_like(line: str) -> bool:
         return False
 
     words = value.split()
-    if len(words) > 8:
+    if not (1 <= len(words) <= 10):
         return False
 
-    lower_words = {w.lower() for w in words}
+    lower_words = {re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", w).casefold() for w in words}
+    lower_words.discard("")
     if lower_words & SENTENCE_HINT_WORDS:
         return False
 
@@ -76,16 +187,11 @@ def is_heading_like(line: str) -> bool:
         return False
 
     ratio = uppercase / alpha
-    if ratio < 0.25:
-        return False
-
-    return True
+    return ratio >= 0.22
 
 
 def _normalize_block_text(lines: list[str]) -> str:
-    # Join once, avoid per-line rstrip copies.
     text = "".join(lines).replace("\x00", "")
-    # Normalize horizontal whitespace line-wise but keep paragraph structure.
     norm_lines = [" ".join(line.rstrip("\n").split()) for line in text.splitlines()]
     text = "\n".join(norm_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -97,7 +203,6 @@ def merge_adjacent_heading_blocks(blocks: list[Block]) -> list[Block]:
         return []
 
     merged: list[Block] = []
-    append_merged = merged.append
     i = 0
     n = len(blocks)
 
@@ -110,12 +215,14 @@ def merge_adjacent_heading_blocks(blocks: list[Block]) -> list[Block]:
                 current.page_index == nxt.page_index
                 and len(current.text) <= 120
                 and len(nxt.text) <= 120
-                and is_heading_like(current.text)
-                and is_heading_like(nxt.text)
+                and is_heading_like_line(current.text)
+                and is_heading_like_line(nxt.text)
+                and not is_region_marker(current.text)
+                and not is_region_marker(nxt.text)
             ):
-                append_merged(
+                merged.append(
                     Block(
-                        block_index=0,  # fixed during final reindex
+                        block_index=0,
                         start_char=current.start_char,
                         end_char=nxt.end_char,
                         text=f"{current.text} {nxt.text}".strip(),
@@ -125,10 +232,9 @@ def merge_adjacent_heading_blocks(blocks: list[Block]) -> list[Block]:
                 i += 2
                 continue
 
-        append_merged(current)
+        merged.append(current)
         i += 1
 
-    # Single final reindex pass.
     return [
         Block(
             block_index=i,
@@ -149,24 +255,20 @@ def _segment_single_page(page_index: int, page_start: int, page_text: str) -> li
     lines = text.splitlines(keepends=True)
 
     blocks: list[Block] = []
-    append_block = blocks.append
-
     current_lines: list[str] = []
-    append_current = current_lines.append
     current_start: int | None = None
     offset = 0
 
     def flush(end_offset: int) -> None:
-        nonlocal current_lines, append_current, current_start
+        nonlocal current_lines, current_start
 
         if current_start is None:
             current_lines = []
-            append_current = current_lines.append
             return
 
         block_text = _normalize_block_text(current_lines)
         if block_text:
-            append_block(
+            blocks.append(
                 Block(
                     block_index=len(blocks),
                     start_char=page_start + current_start,
@@ -177,22 +279,35 @@ def _segment_single_page(page_index: int, page_start: int, page_text: str) -> li
             )
 
         current_lines = []
-        append_current = current_lines.append
         current_start = None
 
-    for raw_line in lines:
+    for idx, raw_line in enumerate(lines):
         line_start = offset
         line_end = offset + len(raw_line)
-        stripped = raw_line.strip()
+        stripped = _normalize_inline_whitespace(raw_line)
 
         if not stripped:
             flush(line_start)
             offset = line_end
             continue
 
-        if REGION_MARKER_RE.match(stripped):
+        current_is_marker = is_region_marker(stripped)
+        current_is_heading = is_heading_like_line(stripped)
+        current_is_meta = is_metadata_like_line(stripped)
+        current_is_list = is_list_like_line(stripped)
+        current_is_toc = is_toc_like_line(stripped)
+
+        next_line = ""
+        if idx + 1 < len(lines):
+            next_line = _normalize_inline_whitespace(lines[idx + 1])
+
+        next_is_marker = is_region_marker(next_line) if next_line else False
+        next_is_heading = is_heading_like_line(next_line) if next_line else False
+
+        # Structural single-line blocks always stand on their own.
+        if current_is_marker or current_is_toc or current_is_heading:
             flush(line_start)
-            append_block(
+            blocks.append(
                 Block(
                     block_index=len(blocks),
                     start_char=page_start + line_start,
@@ -204,9 +319,26 @@ def _segment_single_page(page_index: int, page_start: int, page_text: str) -> li
             offset = line_end
             continue
 
-        if is_heading_like(stripped):
+        # Metadata-ish lines in the early document/header area should usually
+        # stay isolated, especially before markers/headings.
+        if current_is_meta and (next_is_marker or next_is_heading):
             flush(line_start)
-            append_block(
+            blocks.append(
+                Block(
+                    block_index=len(blocks),
+                    start_char=page_start + line_start,
+                    end_char=page_start + line_end,
+                    text=stripped,
+                    page_index=page_index,
+                )
+            )
+            offset = line_end
+            continue
+
+        # List items also stand alone.
+        if current_is_list:
+            flush(line_start)
+            blocks.append(
                 Block(
                     block_index=len(blocks),
                     start_char=page_start + line_start,
@@ -221,7 +353,7 @@ def _segment_single_page(page_index: int, page_start: int, page_text: str) -> li
         if current_start is None:
             current_start = line_start
 
-        append_current(raw_line)
+        current_lines.append(raw_line)
         offset = line_end
 
     flush(len(text))
@@ -230,12 +362,11 @@ def _segment_single_page(page_index: int, page_start: int, page_text: str) -> li
 
 def segment_blocks_on_pages(pages: list[tuple[int, int, int, str]]) -> list[Block]:
     all_blocks: list[Block] = []
-    append_all = all_blocks.append
 
     for page_index, page_start, _page_end, page_text in pages:
         page_blocks = _segment_single_page(page_index, page_start, page_text)
         for block in page_blocks:
-            append_all(
+            all_blocks.append(
                 Block(
                     block_index=len(all_blocks),
                     start_char=block.start_char,

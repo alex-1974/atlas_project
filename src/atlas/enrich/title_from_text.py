@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 
 from atlas.db.connection import get_connection
-from atlas.structure.header_parse import extract_header_lines
 from atlas.structure.header_candidates import extract_header_candidates
+from atlas.structure.document_kind import score_document_kind
 
 
 MAX_CANDIDATE_LINES = 12
@@ -211,7 +211,6 @@ def _score_title_candidate(line_index: int, text: str) -> float:
     elif comma_count == 2:
         score -= 1.5
 
-    # very person-like lines are suspicious as titles
     capitalized_words = sum(1 for w in words if w[:1].isupper())
     if 2 <= length <= 5 and capitalized_words == length and ":" not in text:
         score -= 1.5
@@ -257,7 +256,7 @@ def _needs_review(confidence: float, margin: float, title: str) -> bool:
 
     if DOI_RE.search(lower):
         return True
-        
+
     if PERSON_TITLE_RE.search(lower):
         return True
 
@@ -406,36 +405,35 @@ def enrich_title_from_text() -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             for document_id, source_text, source_name in rows:
-                candidates = extract_header_candidates(source_text)
+                candidates = extract_header_candidates(str(source_text))
                 lines = candidates.title_lines[:40]
                 result = extract_title_from_lines(lines)
 
                 if not result:
                     continue
 
-                title_to_store = result["title"] if not result["needs_review"] else None
+                kind = score_document_kind(str(source_text))
+                best_kind, best_kind_score = kind.best_kind()
+
+                review = bool(result["needs_review"])
+
+                if best_kind in {"article_like", "magazine_article_like"} and best_kind_score >= 0.65:
+                    if result["confidence"] >= 0.60 and result["margin"] >= 0.75:
+                        review = False
+
+                title_to_store = result["title"] if not review else None
                 source_to_store = source_name if title_to_store else None
 
                 cur.execute(
                     """
                     update documents
                     set title = %s,
-                        title_source = %s,
-                        title_score_raw = %s,
-                        title_confidence = %s,
-                        title_score_margin = %s,
-                        title_candidate_count = %s,
-                        title_needs_review = %s
+                        title_source = %s
                     where document_id = %s
                     """,
                     (
                         title_to_store,
                         source_to_store,
-                        result["score"],
-                        result["confidence"],
-                        result["margin"],
-                        result["candidate_count"],
-                        result["needs_review"],
                         document_id,
                     ),
                 )
@@ -461,11 +459,8 @@ def rescore_existing_titles() -> int:
                     cur.execute(
                         """
                         update documents
-                        set title_score_raw = null,
-                            title_confidence = null,
-                            title_score_margin = null,
-                            title_candidate_count = null,
-                            title_needs_review = true
+                        set title = null,
+                            title_source = null
                         where document_id = %s
                         """,
                         (document_id,),
@@ -473,29 +468,28 @@ def rescore_existing_titles() -> int:
                     updated += 1
                     continue
 
-                title_to_store = result["title"] if not result["needs_review"] else None
+                kind = score_document_kind(str(source_text))
+                best_kind, best_kind_score = kind.best_kind()
+
+                review = bool(result["needs_review"])
+
+                if best_kind in {"article_like", "magazine_article_like"} and best_kind_score >= 0.65:
+                    if result["confidence"] >= 0.60 and result["margin"] >= 0.75:
+                        review = False
+
+                title_to_store = result["title"] if not review else None
                 source_to_store = source_name if title_to_store else None
 
                 cur.execute(
                     """
                     update documents
                     set title = %s,
-                        title_source = %s,
-                        title_score_raw = %s,
-                        title_confidence = %s,
-                        title_score_margin = %s,
-                        title_candidate_count = %s,
-                        title_needs_review = %s
+                        title_source = %s
                     where document_id = %s
                     """,
                     (
                         title_to_store,
                         source_to_store,
-                        result["score"],
-                        result["confidence"],
-                        result["margin"],
-                        result["candidate_count"],
-                        result["needs_review"],
                         document_id,
                     ),
                 )
