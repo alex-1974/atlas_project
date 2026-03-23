@@ -515,11 +515,12 @@ body            [000-168]
 
 == Section Tree ==
   - L1 [007-007] 
-  - L1 [010-011] KEY DATING FEATURES FOR TIMBER-FRAMED DWELLINGS IN SURREY
-    - L2 [036-036] lines
+    - L2 [026-026] Building type
     - L2 [049-049] Open-hall plan details
-    - L2 [052-052] differentiated)
     - L2 [059-059] Roof trusses
+    - L2 [104-104] Carpentry
+  - L1 [123-123] 
+  - L1 [167-167] 
 
 == Document Type (Top-k) ==
  1 journal_article      score=0.58 weight=0.58

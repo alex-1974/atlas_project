@@ -18,6 +18,7 @@ from atlas.document_understanding.inference.semantic_zones import compute_semant
 from atlas.document_understanding.inference.signals import compute_signals
 from atlas.document_understanding.inference.zone_hypotheses import compute_zone_hypotheses
 from atlas.document_understanding.inference.zone_memberships import compute_zone_memberships
+from atlas.document_understanding.inference.zones import compute_zones
 from atlas.document_understanding.layers.context import compute_context
 from atlas.document_understanding.layers.document_phase import compute_document_phase
 from atlas.document_understanding.layers.geometry import compute_geometry
@@ -28,7 +29,6 @@ from atlas.document_understanding.layers.surface import compute_surface
 from atlas.document_understanding.layers.topology import compute_topology
 from atlas.document_understanding.layers.typography import compute_typography
 from atlas.document_understanding.layers.section_tree import compute_section_tree
-from atlas.document_understanding.layers.zones import compute_zones
 from atlas.document_understanding.layout.layout_clusters import compute_layout_clusters
 from atlas.document_understanding.layout.layout_graph import compute_layout_graph
 from atlas.document_understanding.persistence.repository import Repository
@@ -164,9 +164,6 @@ def _du_process_document(doc_id: str) -> None:
         compute_consensus(repo, doc_id)
         compute_headings(repo, doc_id)
         compute_document_phase(repo, doc_id)
-        compute_zone_hypotheses(repo, doc_id)
-        compute_zone_memberships(repo, doc_id)
-        compute_semantic_zones(repo, doc_id)
         compute_zones(repo, doc_id)
         compute_section_tree(repo, doc_id)
         compute_document_type(repo, doc_id)
