@@ -139,49 +139,60 @@ def enrich_document(
     return notations
 
 
-def label_for_notation(notation: str) -> str | None:
-    """Fetch the German label for an RVK notation from the API.
-
-    e.g. 'ZH 5500' → 'Historische Gebäude und Denkmäler'
-    Returns None if the API is unavailable or notation not found.
-    """
-    notation_clean = notation.strip().replace(" ", "%20")
-    url = f"{_RVK_API}/node/{urllib.parse.quote(notation_clean)}"
+def _rvk_api_get(url: str) -> dict | None:
+    """HTTP GET to RVK API with encoding detection."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        return data.get("node", {}).get("benennung")
+            raw = resp.read()
+            ct  = resp.headers.get("Content-Type", "")
+            enc = "utf-8" if "utf-8" in ct.lower() else "iso-8859-1"
+            text = raw.decode(enc, errors="replace")
+            if not text.strip().startswith("{"):
+                return None  # HTML error page or XML error response
+            return json.loads(text)
     except Exception as exc:
-        log.debug("RVK label lookup failed for %r: %s", notation, exc)
+        log.debug("RVK API request failed for %r: %s", url, exc)
         return None
 
 
-def search_notation(query: str, max_results: int = 5) -> list[dict]:
-    """Search RVK for notations matching a keyword query.
+def label_for_notation(notation: str) -> str | None:
+    """Fetch the German label for an RVK notation.
 
-    Returns list of {"notation": str, "label": str, "hierarchy": str}
+    e.g. 'ZH 4400' → 'Holzbauten; Fachwerkbauten'
     """
-    url = f"{_RVK_API}/search/{urllib.parse.quote(query)}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as exc:
-        log.debug("RVK search failed for %r: %s", query, exc)
+    url = f"{_RVK_API}/node/{urllib.parse.quote(notation.strip())}"
+    data = _rvk_api_get(url)
+    if not data:
+        return None
+    node = data.get("node", {})
+    if isinstance(node, dict):
+        return node.get("benennung")
+    return None
+
+
+def search_notation(query: str, max_results: int = 5) -> list[dict]:
+    """Search RVK for notations matching a keyword.
+
+    Uses /api/json/nodes/[Begriff] — searches benennung and register fields.
+    Returns list of {"notation": str, "label": str}
+    """
+    url = f"{_RVK_API}/nodes/{urllib.parse.quote(query)}"
+    data = _rvk_api_get(url)
+    if not data:
         return []
 
+    # Response: {"node": [...]} — flat list
+    nodes = data.get("node", [])
+    if isinstance(nodes, dict):
+        nodes = [nodes]
+
     results = []
-    for item in data.get("results", {}).get("result", [])[:max_results]:
+    for item in nodes[:max_results]:
         notation = item.get("notation", "")
         label    = item.get("benennung", "")
-        hier     = item.get("ancestor-notations", "")
-        if notation:
-            results.append({
-                "notation":  notation,
-                "label":     label,
-                "hierarchy": hier,
-            })
+        if notation and label:
+            results.append({"notation": notation, "label": label})
     return results
 
 
@@ -234,45 +245,47 @@ def _lookup_via_api(
     conn: sqlite3.Connection,
     document_id: str,
 ) -> list[str]:
-    """Search RVK API using document title and keywords."""
+    """Search RVK API directly using document keywords.
+
+    Tries individual content words from each keyword against /api/json/nodes/.
+    Returns the first notation found.
+
+    Note: GND→RVK pipeline (gnd.py) is available separately but proved
+    unreliable for heritage/architecture documents — GND entities for these
+    keywords tend to match authors/works rather than subject headings,
+    producing wrong RVK notations (e.g. literary studies instead of
+    architecture). Direct keyword search is more reliable for this corpus.
+    """
     row = conn.execute(
-        "SELECT title, keywords FROM documents WHERE document_id = ?",
+        "SELECT keywords FROM documents WHERE document_id = ?",
         (document_id,),
     ).fetchone()
-
-    if not row:
+    if not row or not row["keywords"]:
         return []
 
-    # Build search query from title + keywords
-    title = row["title"] or ""
-    keywords: list[str] = []
-    if row["keywords"]:
-        try:
-            keywords = json.loads(row["keywords"])
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # Use up to 3 most informative terms
-    search_terms = (keywords[:2] + [title.split()[:5]])
-    query_parts  = []
-    for term in search_terms:
-        if isinstance(term, list):
-            query_parts.append(" ".join(term))
-        elif isinstance(term, str) and term.strip():
-            query_parts.append(term.strip())
-
-    if not query_parts:
+    try:
+        keywords = json.loads(row["keywords"])
+    except (json.JSONDecodeError, TypeError):
         return []
 
-    query = " ".join(query_parts)[:100]
-    results = search_notation(query, max_results=3)
-    time.sleep(_SLEEP)
+    # Try individual content words from each keyword
+    # Single words work best with RVK /nodes/ endpoint
+    candidates: list[str] = []
+    for kw in keywords[:6]:
+        for word in kw.split():
+            if len(word) >= 5 and word.lower() not in candidates:
+                candidates.append(word.lower())
+        # Also try full 2-word phrases
+        if len(kw.split()) == 2 and kw not in candidates:
+            candidates.append(kw)
 
-    if not results:
-        return []
+    for query in candidates[:10]:
+        results = search_notation(query, max_results=3)
+        time.sleep(_SLEEP)
+        if results:
+            return [results[0]["notation"]]
 
-    # Return the top result's notation
-    return [results[0]["notation"]]
+    return []
 
 
 # ── Database write ────────────────────────────────────────────────────────────

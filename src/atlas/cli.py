@@ -640,6 +640,7 @@ def enrich(
     do_keywords:  bool = typer.Option(False, "--keywords",          help="Keywords via YAKE (lokal, schnell)"),
     do_kw_sem:    bool = typer.Option(False, "--keywords-semantic",  help="Keywords via KeyBERT (semantisch, langsamer)"),
     do_themes:    bool = typer.Option(False, "--themes",             help="Themen via RVK + Wikidata"),
+    do_gnd:       bool = typer.Option(False, "--gnd",               help="GND-Entitäten via lobid.org"),
     do_crossref:  bool = typer.Option(False, "--crossref",          help="CrossRef (braucht Netz)"),
     do_wikidata:  bool = typer.Option(False, "--wikidata",          help="Wikidata (braucht Netz)"),
     do_rvk:       bool = typer.Option(False, "--rvk",               help="RVK (lokal + Netz)"),
@@ -671,9 +672,10 @@ def enrich(
         return
 
     # Ohne explizite Flags: YAKE-Keywords lokal
-    run_keywords     = do_keywords or not any([do_crossref, do_wikidata, do_rvk, do_kw_sem, do_themes])
+    run_keywords     = do_keywords or not any([do_crossref, do_wikidata, do_rvk, do_kw_sem, do_themes, do_gnd])
     run_kw_semantic  = do_kw_sem
     run_themes       = do_themes
+    run_gnd          = do_gnd
 
     summary: list[dict] = []
 
@@ -721,6 +723,26 @@ def enrich(
                 entry["themes_error"] = str(exc)
                 if not as_json:
                     console.print(f"    [yellow]Themen: {exc}[/yellow]")
+
+        if run_gnd:
+            try:
+                from atlas.enrich.gnd import enrich_document as _gnd
+                ks = None
+                try:
+                    from atlas.knowledge.store import KnowledgeStore
+                    ks = KnowledgeStore.open(root)
+                except Exception:
+                    pass
+                gnd_ids = _gnd(conn, did, store=ks)
+                entry["gnd"] = gnd_ids
+                if gnd_ids and not as_json:
+                    console.print(f"    GND: {', '.join(gnd_ids[:3])}")
+                elif not gnd_ids and not as_json:
+                    console.print("    GND: keine Entitäten gefunden")
+            except Exception as exc:
+                entry["gnd_error"] = str(exc)
+                if not as_json:
+                    console.print(f"    [yellow]GND: {exc}[/yellow]")
 
         if do_crossref:
             try:
