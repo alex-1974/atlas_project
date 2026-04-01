@@ -212,10 +212,17 @@ class KnowledgeStore:
     def query(self, sparql: str) -> list[dict]:
         """Execute a SELECT query, return list of binding dicts."""
         results = self._store.query(sparql)
-        return [
-            {k: v for k, v in row.items()}
-            for row in results
-        ]
+        # pyoxigraph 0.5: variables on QuerySolutions, rows indexed by position.
+        # Variable names include the leading '?' — strip it for clean dict keys.
+        variables = [str(v).lstrip("?") for v in results.variables]
+        out = []
+        for row in results:
+            out.append({
+                var: row[i]
+                for i, var in enumerate(variables)
+                if row[i] is not None
+            })
+        return out
 
     def triples_for_doc(
         self, document_id: str
