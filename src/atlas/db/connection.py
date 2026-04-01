@@ -1,21 +1,20 @@
+# src/atlas/db/connection.py
 from __future__ import annotations
 
-import psycopg
+import sqlite3
+from pathlib import Path
 
-from atlas.settings import load_settings
 
+def connect(db_path: Path) -> sqlite3.Connection:
+    """Open a SQLite connection with the required Atlas pragmas.
 
-def get_connection():
-    settings = load_settings()
-
-    try:
-        url = settings["database"]["url"]
-    except KeyError as exc:
-        raise KeyError(
-            "Missing config key: database.url"
-        ) from exc
-
-    if not url:
-        raise ValueError("database.url is empty in Atlas config")
-
-    return psycopg.connect(url)
+    Creates parent directories if they don't exist yet.
+    Caller is responsible for closing the connection.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn

@@ -5,16 +5,58 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atlas-catalog"
 version = "0.1.0"
-description = "Literature catalog and knowledge mapping system"
+description = "Lokales Werkzeug zur Erschließung wissenschaftlicher PDF-Sammlungen"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "typer",
-    "PyYAML",
+    # CLI + Terminal
+    "typer>=0.12",
+    "rich>=13",
+
+    # PDF-Verarbeitung
+    "PyMuPDF>=1.24",
+    "pdfplumber>=0.11",
+
+    # Konfiguration — tomllib ist ab Python 3.11 eingebaut
+]
+
+[project.optional-dependencies]
+# Semantische Suche (Phase 2)
+search = [
+    "lancedb>=0.6",
+    "sentence-transformers>=3",
+]
+# Wissensgraph (Phase 2)
+graph = [
+    "pyoxigraph>=0.3",
+]
+# OCR (optional)
+ocr = [
+    "pytesseract>=0.3",
+    "Pillow>=10",
+]
+# Entwicklung
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "mypy",
 ]
 
 [project.scripts]
-atlas = "atlas.cli:main"
+atlas = "atlas.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["atlas_old*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
