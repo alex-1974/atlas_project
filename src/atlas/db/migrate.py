@@ -1,65 +1,83 @@
+# src/atlas/db/migrate.py
 from __future__ import annotations
-
+import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
-from atlas.db.connection import get_connection
-from atlas.settings import get_project_root
+
+@dataclass(frozen=True)
+class Migration:
+    version: str
+    path: Path
+    sql: str
 
 
-def get_migration_dir() -> Path:
-    return get_project_root() / "migrations"
+def _migrations_dir() -> Path:
+    return Path(__file__).resolve().parent / "migrations"
 
 
-def ensure_schema_migrations_table() -> None:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                create table if not exists schema_migrations (
-                    migration_name text primary key,
-                    applied_at timestamptz not null default now()
-                );
-                """
-            )
+def _ensure_migrations_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     TEXT PRIMARY KEY,
+            applied_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
 
 
-def get_applied_migrations() -> set[str]:
-    ensure_schema_migrations_table()
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select migration_name from schema_migrations")
-            return {row[0] for row in cur.fetchall()}
-
-
-def mark_migration_applied(migration_name: str) -> None:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into schema_migrations (migration_name)
-                values (%s)
-                on conflict (migration_name) do nothing
-                """,
-                (migration_name,),
-            )
+def _load_migrations() -> list[Migration]:
+    migrations_dir = _migrations_dir()
+    if not migrations_dir.exists():
+        return []
+    migrations: list[Migration] = []
+    for path in sorted(migrations_dir.glob("*.sql")):
+        migrations.append(Migration(
+            version=path.stem,
+            path=path,
+            sql=path.read_text(encoding="utf-8"),
+        ))
+    return migrations
 
 
-def run_migrations() -> None:
-    migration_dir = get_migration_dir()
-    files = sorted(migration_dir.glob("*.sql"))
-    applied = get_applied_migrations()
+def _applied_versions(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
+    return {row["version"] for row in rows}
 
-    for path in files:
-        if path.name in applied:
-            print(f"skipped migration: {path.name}")
+
+def run_migrations(conn: sqlite3.Connection) -> None:
+    """Apply all pending migrations in version order."""
+    _ensure_migrations_table(conn)
+    applied = _applied_versions(conn)
+    for migration in _load_migrations():
+        if migration.version in applied:
             continue
+        conn.executescript(migration.sql)
+        conn.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            (migration.version,),
+        )
+        conn.commit()
 
-        sql = path.read_text(encoding="utf-8")
 
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
+def assert_schema_current(conn: sqlite3.Connection) -> None:
+    """Raise if any migration has not been applied."""
+    _ensure_migrations_table(conn)
+    available = {m.version for m in _load_migrations()}
+    missing = sorted(available - _applied_versions(conn))
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(
+            f"Catalog schema is outdated — missing migrations: {joined}. "
+            f"Run 'atlas dev db migrate' to update."
+        )
 
-        mark_migration_applied(path.name)
-        print(f"applied migration: {path.name}")
+
+def list_applied(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all applied migrations ordered by version."""
+    _ensure_migrations_table(conn)
+    return conn.execute(
+        "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+    ).fetchall()

@@ -384,12 +384,15 @@ def is_formula_label(text: str | None) -> bool:
 
 # ── Letter-spacing detection (Fall B — text pattern) ─────────────────────────
 
-# Matches text where each character is separated by a space:
-# "B U R G A G E P L O T S" — at least 4 spaced uppercase letters.
+# Matches text where each character (or short token) is separated by a space.
+# "B U R G A G E P L O T S" — at least 4 spaced tokens of 1-3 chars.
+# Also handles tokens with dashes/em-dashes:
+# "T H E L AW N M A R K E T – N O RT H S I D E"
 # This is a PDF extraction artefact: letter-spaced text encoded as
 # individual characters with spaces between them.
+_LETTER_SPACED_TOKEN = r'[A-Za-z\u00C0-\u00FF]{1,3}|[–—\-]'
 _LETTER_SPACED_RE = re.compile(
-    r'^(?:[A-Z\u00C0-\u00D6\u00D8-\u00DE] ){4,}[A-Z\u00C0-\u00D6\u00D8-\u00DE]'
+    r'^(?:(?:' + _LETTER_SPACED_TOKEN + r')\s+){3,}(?:' + _LETTER_SPACED_TOKEN + r')\s*$'
 )
 
 
@@ -414,7 +417,7 @@ def is_letter_spaced_text(text: str | None) -> bool:
 # Matches letter-spaced tokens: 1–3 uppercase chars separated by spaces,
 # minimum 4 tokens. Handles double spaces between word groups.
 _LETTER_SPACED_COLLAPSE_RE = re.compile(
-    r'^(?:[A-Za-z\u00C0-\u00FF]{1,3}\s+){3,}[A-Za-z\u00C0-\u00FF]{1,3}\s*$'
+    r'^(?:(?:[A-Za-z\u00C0-\u00FF]{1,3}|[–—\-])\s+){3,}(?:[A-Za-z\u00C0-\u00FF]{1,3}|[–—\-])\s*$'
 )
 
 
@@ -426,10 +429,11 @@ def normalize_letter_spaced(text: str | None) -> str:
         'C A S T L E  H I L L'                          → 'CASTLE HILL'
         'VA RY I N G  B U R G A G E  P L O T  W I D T H S'
                                                          → 'VARYING BURGAGE PLOT WIDTHS'
-        'D E V E L O P M E N T  O F  T H E  B U R G H'  → 'DEVELOPMENT OF THE BURGH'
 
-    Word boundaries are detected from runs of 2+ spaces in the raw text.
-    Single spaces separate individual characters within a word.
+    Word boundaries are detected from:
+    - Runs of 2+ spaces in the raw text
+    - Newlines (multi-line letter-spaced blocks merged by block_segmentation)
+
     Capitalisation is preserved — no case conversion is applied.
 
     Returns the text whitespace-normalised but otherwise unchanged if it
@@ -438,6 +442,22 @@ def normalize_letter_spaced(text: str | None) -> str:
     raw = (text or "").strip()
     if not raw:
         return raw
+
+    # Treat newlines as word boundaries before checking the pattern
+    # Multi-line letter-spaced blocks: "T H E  PAT T E R N\nD E V E L O P M E N T"
+    # becomes "T H E  PAT T E R N  D E V E L O P M E N T" (double space = boundary)
+    if "\n" in raw:
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if len(lines) > 1:
+            # Check if each line looks letter-spaced
+            normalised_lines = [" ".join(l.split()) for l in lines]
+            all_letter_spaced = all(
+                _LETTER_SPACED_COLLAPSE_RE.match(nl) for nl in normalised_lines
+            )
+            if all_letter_spaced:
+                # Join lines with double space (word boundary)
+                raw = "  ".join(lines)
+
     normalised = " ".join(raw.split())
     if not _LETTER_SPACED_COLLAPSE_RE.match(normalised):
         return normalised
