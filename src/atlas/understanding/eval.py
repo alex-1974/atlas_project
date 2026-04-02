@@ -125,7 +125,7 @@ def load_document_gt(path: Path) -> dict[str, DocumentGT]:
     with path.open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             did = row["document_id"].strip()
-            authors_raw = row.get("expected_authors", "")
+            authors_raw = row.get("expected_authors") or ""
             authors = [a.strip() for a in authors_raw.split(";") if a.strip()]
             result[did] = DocumentGT(
                 document_id=did,

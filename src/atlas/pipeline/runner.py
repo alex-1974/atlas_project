@@ -257,8 +257,8 @@ def _promote_identifiers(conn: sqlite3.Connection, document_id: str) -> None:
                      ("isbn", "isbn"), ("pmid", "pmid")]:
         row = conn.execute(
             """
-            SELECT value FROM document_identifiers
-            WHERE document_id = ? AND type = ?
+            SELECT identifier_value FROM document_identifiers
+            WHERE document_id = ? AND identifier_type = ?
             ORDER BY rowid LIMIT 1
             """,
             (document_id, typ),
@@ -267,7 +267,7 @@ def _promote_identifiers(conn: sqlite3.Connection, document_id: str) -> None:
             conn.execute(
                 f"UPDATE documents SET {col} = COALESCE({col}, ?) "
                 "WHERE document_id = ?",
-                (row["value"], document_id),
+                (row["identifier_value"], document_id),
             )
     conn.commit()
 

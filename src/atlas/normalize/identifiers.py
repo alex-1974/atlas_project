@@ -51,62 +51,44 @@ def normalize_identifier(identifier_type: str, value: str) -> str:
 
 
 def normalize_identifiers() -> int:
+    # Schema (migration 0002): id, document_id, identifier_type, identifier_value, source
     changed = 0
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, document_id, identifier_type, identifier_value FROM document_identifiers"
+        )
+        rows = cur.fetchall()
+
+        for row_id, document_id, identifier_type, identifier_value in rows:
+            new_value = normalize_identifier(identifier_type, identifier_value)
+            if new_value == identifier_value:
+                continue
+
+            # Check if normalized value already exists for this document
             cur.execute(
                 """
-                select identifier_id, document_id, identifier_type, identifier_value
-                from document_identifiers
-                """
+                SELECT id FROM document_identifiers
+                WHERE document_id = ?
+                  AND identifier_type = ?
+                  AND identifier_value = ?
+                  AND id != ?
+                LIMIT 1
+                """,
+                (document_id, identifier_type, new_value, row_id),
             )
-            rows = cur.fetchall()
-
-        with conn.cursor() as cur:
-            for identifier_id, document_id, identifier_type, identifier_value in rows:
-                new_value = normalize_identifier(identifier_type, identifier_value)
-
-                if new_value == identifier_value:
-                    continue
-
-                # Prüfen, ob der normalisierte Zielwert im selben Dokument schon existiert
+            if cur.fetchone():
+                # Duplicate after normalization — remove this row
+                cur.execute("DELETE FROM document_identifiers WHERE id = ?", (row_id,))
+            else:
                 cur.execute(
-                    """
-                    select identifier_id
-                    from document_identifiers
-                    where document_id = %s
-                      and identifier_type = %s
-                      and identifier_value = %s
-                      and identifier_id <> %s
-                    limit 1
-                    """,
-                    (document_id, identifier_type, new_value, identifier_id),
+                    "UPDATE document_identifiers SET identifier_value = ? WHERE id = ?",
+                    (new_value, row_id),
                 )
-                existing = cur.fetchone()
+            changed += 1
 
-                if existing:
-                    # Zielwert existiert schon -> diesen Datensatz löschen
-                    cur.execute(
-                        """
-                        delete from document_identifiers
-                        where identifier_id = %s
-                        """,
-                        (identifier_id,),
-                    )
-                    changed += 1
-                    continue
-
-                cur.execute(
-                    """
-                    update document_identifiers
-                    set identifier_value = %s
-                    where identifier_id = %s
-                    """,
-                    (new_value, identifier_id),
-                )
-                changed += 1
-
+        conn.commit()
     return changed
 
 
@@ -114,18 +96,23 @@ def dedupe_identifiers() -> int:
     removed = 0
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                delete from document_identifiers a
-                using document_identifiers b
-                where a.identifier_id < b.identifier_id
-                  and a.document_id = b.document_id
-                  and a.identifier_type = b.identifier_type
-                  and a.identifier_value = b.identifier_value
-                returning a.identifier_id
-                """
+        cur = conn.cursor()
+        # Find duplicate rows (same document_id, identifier_type, identifier_value)
+        # keep the row with the lowest id
+        cur.execute(
+            """
+            SELECT id FROM document_identifiers
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM document_identifiers
+                GROUP BY document_id, identifier_type, identifier_value
             )
-            removed = len(cur.fetchall())
+            """
+        )
+        duplicate_ids = [row[0] for row in cur.fetchall()]
+        for row_id in duplicate_ids:
+            cur.execute("DELETE FROM document_identifiers WHERE id = ?", (row_id,))
+            removed += 1
+        conn.commit()
 
     return removed

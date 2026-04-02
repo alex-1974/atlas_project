@@ -11,7 +11,7 @@ def run_pdftotext_fallback() -> int:
     processed = 0
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
             cur.execute(
                 """
                 select

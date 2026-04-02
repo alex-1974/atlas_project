@@ -39,18 +39,12 @@ def _font_flags_to_style(flags: int | None) -> tuple[bool, bool]:
 
 def already_extracted(document_id: str) -> bool:
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select 1
-                from extracted_texts
-                where document_id = %s
-                  and extract_status = 'ok'
-                limit 1
-                """,
-                (document_id,),
-            )
-            return cur.fetchone() is not None
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM extracted_texts WHERE document_id = ? LIMIT 1",
+            (document_id,),
+        )
+        return cur.fetchone() is not None
 
 
 def store_extraction(
@@ -62,33 +56,19 @@ def store_extraction(
     extract_status: str,
     extract_error: str | None,
 ) -> None:
+    # Schema (migration 0002): document_id, text, text_length, method
+    # Fehler werden in documents.pipeline_error gespeichert, nicht hier.
+    if extract_status != "ok" or text_full is None:
+        return
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into extracted_texts (
-                    extraction_id,
-                    document_id,
-                    extractor,
-                    text_full,
-                    text_length,
-                    nul_bytes_removed,
-                    extract_status,
-                    extract_error
-                )
-                values (%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    document_id,
-                    extractor,
-                    text_full,
-                    text_length,
-                    nul_bytes_removed,
-                    extract_status,
-                    extract_error,
-                ),
-            )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO extracted_texts (document_id, text, text_length, method)
+            VALUES (?, ?, ?, ?)
+            """,
+            (document_id, text_full, text_length, extractor),
+        )
         conn.commit()
 
 
@@ -98,66 +78,66 @@ def _store_layout(
     span_rows: list[tuple],
 ) -> None:
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("delete from du_layout_spans where document_id = %s", (document_id,))
-            cur.execute("delete from du_layout_lines where document_id = %s", (document_id,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM du_layout_spans WHERE document_id = ?", (document_id,))
+        cur.execute("DELETE FROM du_layout_lines WHERE document_id = ?", (document_id,))
 
-            if span_rows:
-                cur.executemany(
-                    """
-                    insert into du_layout_spans (
-                        layout_span_id,
-                        document_id,
-                        page_index,
-                        block_no,
-                        line_no,
-                        span_no,
-                        reading_order,
-                        text,
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        page_width,
-                        page_height,
-                        font_name,
-                        font_size,
-                        font_flags,
-                        is_bold,
-                        is_italic
-                    )
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    span_rows,
+        if span_rows:
+            cur.executemany(
+                """
+                INSERT INTO du_layout_spans (
+                    layout_span_id,
+                    document_id,
+                    page_index,
+                    block_no,
+                    line_no,
+                    span_no,
+                    reading_order,
+                    text,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    page_width,
+                    page_height,
+                    font_name,
+                    font_size,
+                    font_flags,
+                    is_bold,
+                    is_italic
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                span_rows,
+            )
 
-            if line_rows:
-                cur.executemany(
-                    """
-                    insert into du_layout_lines (
-                        layout_line_id,
-                        document_id,
-                        page_index,
-                        block_no,
-                        line_no,
-                        reading_order,
-                        text,
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        page_width,
-                        page_height,
-                        font_name,
-                        font_size,
-                        font_flags,
-                        is_bold,
-                        is_italic
-                    )
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    line_rows,
+        if line_rows:
+            cur.executemany(
+                """
+                INSERT INTO du_layout_lines (
+                    layout_line_id,
+                    document_id,
+                    page_index,
+                    block_no,
+                    line_no,
+                    reading_order,
+                    text,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    page_width,
+                    page_height,
+                    font_name,
+                    font_size,
+                    font_flags,
+                    is_bold,
+                    is_italic
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                line_rows,
+            )
         conn.commit()
 
 

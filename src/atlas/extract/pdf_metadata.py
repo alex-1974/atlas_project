@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
 
 import fitz
-from psycopg.types.json import Json
 
 from atlas.db.connection import get_connection
 
@@ -15,7 +13,6 @@ def read_metadata(path: Path) -> dict | None:
             meta = doc.metadata or {}
     except Exception:
         return None
-
     return {
         "title": meta.get("title"),
         "author": meta.get("author"),
@@ -25,62 +22,61 @@ def read_metadata(path: Path) -> dict | None:
         "producer": meta.get("producer"),
         "creation_date": meta.get("creationDate"),
         "mod_date": meta.get("modDate"),
-        "raw": meta,
     }
 
 
 def extract_pdf_metadata() -> int:
+    # Schema (migration 0002): extracted_metadata
+    # Columns: document_id, method, pdf_title, pdf_author, pdf_subject,
+    #          pdf_keywords, pdf_creator, pdf_producer,
+    #          pdf_creation_date_raw, pdf_mod_date_raw
     inserted = 0
-
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.document_id, d.file_path
+            FROM documents d
+            LEFT JOIN extracted_metadata em ON em.document_id = d.document_id
+            WHERE em.document_id IS NULL
+            """
+        )
+        rows = cur.fetchall()
+
+        for document_id, file_path in rows:
+            meta = read_metadata(Path(file_path))
+            if not meta:
+                continue
             cur.execute(
                 """
-                select d.document_id, d.file_path
-                from documents d
-                left join pdf_metadata pm on pm.document_id = d.document_id
-                where pm.document_id is null
-                """
-            )
-            rows = cur.fetchall()
-
-        with conn.cursor() as cur:
-            for document_id, file_path in rows:
-                meta = read_metadata(Path(file_path))
-                if not meta:
-                    continue
-
-                cur.execute(
-                    """
-                    insert into pdf_metadata (
-                        metadata_id,
-                        document_id,
-                        title,
-                        author,
-                        subject,
-                        keywords,
-                        creator,
-                        producer,
-                        creation_date,
-                        mod_date,
-                        raw_json
-                    )
-                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        document_id,
-                        meta["title"],
-                        meta["author"],
-                        meta["subject"],
-                        meta["keywords"],
-                        meta["creator"],
-                        meta["producer"],
-                        meta["creation_date"],
-                        meta["mod_date"],
-                        Json(meta["raw"]),
-                    ),
+                INSERT OR REPLACE INTO extracted_metadata (
+                    document_id,
+                    method,
+                    pdf_title,
+                    pdf_author,
+                    pdf_subject,
+                    pdf_keywords,
+                    pdf_creator,
+                    pdf_producer,
+                    pdf_creation_date_raw,
+                    pdf_mod_date_raw
                 )
-                inserted += 1
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    "pymupdf",
+                    meta["title"],
+                    meta["author"],
+                    meta["subject"],
+                    meta["keywords"],
+                    meta["creator"],
+                    meta["producer"],
+                    meta["creation_date"],
+                    meta["mod_date"],
+                ),
+            )
+            inserted += 1
 
+        conn.commit()
     return inserted

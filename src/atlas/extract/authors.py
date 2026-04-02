@@ -207,22 +207,22 @@ def _heuristic_author_candidates(text: str) -> list[str]:
 def _upsert_author(display_name: str) -> str:
     normalized_name = normalize_author_name(display_name)
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select author_id from authors where normalized_name = %s", (normalized_name,))
+        cur = conn.cursor()
+            cur.execute("select author_id from authors where normalized_name = ?", (normalized_name,))
             row = cur.fetchone()
             if row:
                 return row[0]
             author_id = str(uuid.uuid4())
-            cur.execute("insert into authors (author_id, display_name, normalized_name) values (%s,%s,%s)", (author_id, display_name, normalized_name))
+            cur.execute("insert into authors (author_id, display_name, normalized_name) values (?,?,?)", (author_id, display_name, normalized_name))
             return author_id
 
 
 def _insert_document_author(document_id: str, author_id: str, author_position: int | None, source: str) -> bool:
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
             cur.execute("""
                 insert into document_authors (document_author_id, document_id, author_id, author_position, source)
-                values (%s,%s,%s,%s,%s)
+                values (?,?,?,?,?)
                 on conflict (document_id, author_id) do nothing
             """, (str(uuid.uuid4()), document_id, author_id, author_position, source))
             return cur.rowcount == 1
@@ -231,7 +231,7 @@ def _insert_document_author(document_id: str, author_id: str, author_position: i
 def extract_authors_from_pdf_metadata() -> int:
     inserted = 0
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
             cur.execute("select document_id, author from pdf_metadata where author is not null and btrim(author) <> ''")
             rows = cur.fetchall()
     for document_id, raw_author in rows:
@@ -280,7 +280,7 @@ def parse_authors_from_text(text: str) -> list[tuple[str, int, str]]:
 def extract_authors_from_text() -> int:
     inserted = 0
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
             cur.execute("""
                 select d.document_id,
                        coalesce(fm.text, tp.text, e.text_full) as source_text
