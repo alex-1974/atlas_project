@@ -1,26 +1,36 @@
 # src/atlas/enrich/topic.py
-"""Topic extraction — one descriptive sentence per document.
+"""Topic extraction — semantically normalized concept per document.
 
-Topic vs. Keywords
-------------------
-Topic  = "Was ist dieses Dokument?" — ein kohärenter Satz
-Keywords = "Welche Terme sind wichtig?" — diskrete Terme
+Topic vs. extractive summary
+-----------------------------
+A topic is not a sentence extracted from the document — it is the
+dominant semantic concept, normalized against a controlled vocabulary.
 
-Topic-Extraktion ist extractive (kein LLM nötig):
-Der erste informative Body-Block nach dem Titel ist bei
-wissenschaftlichen und historischen Dokumenten meistens
-der beste Topic-Kandidat — er fasst den Dokumentinhalt
-in einem Satz zusammen.
+'Niederdeutsches Hallenhaus' (GND preferred label) is better than
+'Das Niederdeutsche Hallenhaus ist Bauernhaus des Jahres 2023' as a
+topic because it is:
+  - concise (a concept, not a sentence)
+  - controlled (matches GND / RVK / library headings)
+  - searchable (other systems use the same label)
 
-Extraktionskette:
-    1. Expliziter Abstract-Block (falls vorhanden)
-    2. Erster langer Body-Block (≥ 15 Wörter) auf Seite 0-1
-    3. Zusammengesetzt aus Titel + ersten 2 Headings
-    4. Titel allein als Fallback
+Pipeline
+--------
+1. Collect candidates from title + YAKE keywords (already stored)
+2. Look up GND preferred labels for stored GND identifiers
+3. Score each candidate:
+     +3 if found in document title
+     +2 if found in stored keywords
+     +1 for each GND entity of type SubjectHeading
+     +1 for PlaceOrGeographicName / BuildingOrMemorial
+      0 for Persons, CorporateBodies (filtered out)
+4. Top-1 preferred label → documents.topic
 
-Schreibt in:
+Fallback chain (no network / no GND data):
+    YAKE keyword that appears in title → first YAKE keyword → title
+
+Stored in:
     documents.topic (TEXT)
-    Oxigraph: atlas:topic Tripel (optional)
+    Oxigraph: atlas:topic triple (optional)
 """
 from __future__ import annotations
 
@@ -28,8 +38,24 @@ import json
 import logging
 import re
 import sqlite3
+import time
+import urllib.request
 
 log = logging.getLogger(__name__)
+
+_LOBID_API  = "https://lobid.org/gnd"
+_USER_AGENT = "Atlas/2.0 (atlas-catalog) Python"
+_SLEEP      = 0.5
+
+# GND types that represent subject concepts (not persons or organisations)
+_SUBJECT_TYPES = {
+    "SubjectHeading",
+    "SubjectHeadingSensoStricto",
+    "PlaceOrGeographicName",
+    "BuildingOrMemorial",
+    "EthnographicName",
+    "NaturalGeographicUnit",
+}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -40,11 +66,10 @@ def extract_topic(
     store=None,
     force: bool = False,
 ) -> str | None:
-    """Extract and store a topic sentence for a document.
+    """Extract and store the dominant topic for a document.
 
     Returns the topic string, or None if extraction failed.
     """
-    # Skip if already extracted
     if not force:
         row = conn.execute(
             "SELECT topic FROM documents WHERE document_id = ?",
@@ -54,14 +79,12 @@ def extract_topic(
             return row["topic"]
 
     topic = (
-        _topic_from_abstract_block(conn, document_id)
-        or _topic_from_first_body_block(conn, document_id)
-        or _topic_from_title_and_headings(conn, document_id)
+        _topic_via_gnd(conn, document_id)
+        or _topic_from_keywords(conn, document_id)
         or _topic_from_title(conn, document_id)
     )
 
     if topic:
-        topic = _clean_topic(topic)
         _write_topic(conn, document_id, topic)
         if store is not None:
             _write_topic_triple(store, document_id, topic)
@@ -83,254 +106,173 @@ def topic_for_document(
     return extract_topic(conn, document_id)
 
 
-# ── Extraction methods ────────────────────────────────────────────────────────
+# ── GND-based topic extraction ────────────────────────────────────────────────
 
-def _topic_from_abstract_block(
+def _topic_via_gnd(
     conn: sqlite3.Connection,
     document_id: str,
 ) -> str | None:
-    """Use the abstract block if explicitly marked."""
-    # Check stored abstract first
-    row = conn.execute(
-        "SELECT abstract FROM documents WHERE document_id = ?",
-        (document_id,),
-    ).fetchone()
-    if row and row["abstract"] and len(row["abstract"].split()) >= 10:
-        # First sentence of abstract
-        return _first_sentence(row["abstract"])
+    """Find the dominant topic using stored GND identifiers.
 
-    # Look for abstract marker in DU output
-    marker = conn.execute(
-        """
-        SELECT b.block_index FROM du_block_semantic_micro sm
-        JOIN du_blocks b ON b.block_id = sm.block_id
-        WHERE b.document_id = ? AND sm.is_abstract_marker = 1
-        ORDER BY b.block_index LIMIT 1
-        """,
-        (document_id,),
-    ).fetchone()
-
-    if not marker:
-        return None
-
-    # Get the block(s) immediately after the abstract marker
-    abstract_blocks = conn.execute(
-        """
-        SELECT b.text FROM du_blocks b
-        JOIN du_block_roles r ON r.block_id = b.block_id
-        WHERE b.document_id = ?
-          AND b.block_index > ?
-          AND b.block_index <= ?
-          AND r.role = 'body'
-        ORDER BY b.block_index
-        LIMIT 3
-        """,
-        (document_id, marker["block_index"], marker["block_index"] + 5),
-    ).fetchall()
-
-    if not abstract_blocks:
-        return None
-
-    text = " ".join(b["text"] or "" for b in abstract_blocks).strip()
-    if len(text.split()) >= 10:
-        return _first_sentence(text)
-    return None
-
-
-def _topic_from_first_body_block(
-    conn: sqlite3.Connection,
-    document_id: str,
-) -> str | None:
-    """Use the first substantial body block in the body zone.
-
-    For articles: typically on pages 0-2.
-    For monographs: may be much later (after copyright pages, preface, ToC).
-    Uses du_block_zones to find blocks in the 'body' zone rather than
-    relying on page numbers.
+    Looks up preferred labels via lobid.org and scores them against
+    the document title and keywords.
     """
-    # Try zone-based selection first (more reliable for monographs)
-    rows = conn.execute(
-        """
-        SELECT b.text, b.page_index FROM du_blocks b
-        JOIN du_block_roles r ON r.block_id = b.block_id
-        JOIN du_block_zones z ON z.block_id = b.block_id
-        WHERE b.document_id = ?
-          AND r.role = 'body'
-          AND z.zone IN ('body', 'abstract')
-        ORDER BY b.block_index
-        LIMIT 40
-        """,
-        (document_id,),
-    ).fetchall()
+    gnd_ids = _get_gnd_ids(conn, document_id)
+    if not gnd_ids:
+        return None
 
-    # Fallback: first pages (for documents without zone data)
-    if not rows:
-        rows = conn.execute(
-            """
-            SELECT b.text, b.page_index FROM du_blocks b
-            JOIN du_block_roles r ON r.block_id = b.block_id
-            WHERE b.document_id = ?
-              AND r.role = 'body'
-              AND b.page_index <= 5
-            ORDER BY b.block_index
-            LIMIT 40
-            """,
-            (document_id,),
-        ).fetchall()
+    title    = _get_title(conn, document_id)
+    keywords = _get_keywords(conn, document_id)
 
-    for row in rows:
-        text = (row["text"] or "").strip()
-        words = text.split()
-        if len(words) >= 15:
-            if _is_metadata_text(text):
-                continue
-            return _first_sentence(text) or text[:200]
+    title_lower    = title.lower() if title else ""
+    keyword_lowers = {kw.lower() for kw in keywords}
 
-    return None
+    scored: list[tuple[float, str]] = []
+
+    for gnd_id in gnd_ids[:10]:
+        entity = _lobid_fetch(gnd_id)
+        if not entity:
+            continue
+        time.sleep(_SLEEP)
+
+        types  = set(entity.get("type", []))
+        label  = entity.get("label", "").strip()
+
+        if not label:
+            continue
+
+        # Only subject concepts — skip persons and corporate bodies
+        if not (types & _SUBJECT_TYPES):
+            continue
+
+        score = 1.0
+
+        # Strong signal: label appears in title
+        label_lower = label.lower()
+        if label_lower in title_lower:
+            score += 3.0
+        elif any(word in title_lower for word in label_lower.split()
+                 if len(word) >= 5):
+            score += 1.0
+
+        # Medium signal: label appears in keywords
+        if label_lower in keyword_lowers:
+            score += 2.0
+        elif any(label_lower in kw.lower() or kw.lower() in label_lower
+                 for kw in keywords):
+            score += 1.0
+
+        # Prefer SubjectHeading over geographic names
+        if "SubjectHeading" in types or "SubjectHeadingSensoStricto" in types:
+            score += 1.0
+        elif "PlaceOrGeographicName" in types or "BuildingOrMemorial" in types:
+            # Geographic entities only qualify if they have a strong title match
+            if label_lower not in title_lower:
+                continue  # skip geographic entities without title match
+
+        scored.append((score, label))
+
+    if not scored:
+        return None
+
+    # Return highest-scored label
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1]
 
 
-def _topic_from_title_and_headings(
+def _lobid_fetch(gnd_id: str) -> dict | None:
+    """Fetch GND entity data from lobid.org."""
+    url = f"{_LOBID_API}/{gnd_id}.json"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return {
+            "label": data.get("preferredName", ""),
+            "type":  data.get("type", []),
+        }
+    except Exception as exc:
+        log.debug("lobid fetch failed for %r: %s", gnd_id, exc)
+        return None
+
+
+# ── Fallback methods ──────────────────────────────────────────────────────────
+
+def _topic_from_keywords(
     conn: sqlite3.Connection,
     document_id: str,
 ) -> str | None:
-    """Compose topic from title + first two L1 headings."""
-    doc = conn.execute(
-        "SELECT title FROM documents WHERE document_id = ?",
-        (document_id,),
-    ).fetchone()
-    if not doc or not doc["title"]:
+    """Use the best YAKE keyword as topic fallback.
+
+    Prefers keywords that also appear in the title.
+    """
+    keywords = _get_keywords(conn, document_id)
+    title    = (_get_title(conn, document_id) or "").lower()
+
+    if not keywords:
         return None
 
-    title = doc["title"].strip()
+    # Prefer multi-word keywords that appear in title
+    for kw in keywords:
+        if len(kw.split()) >= 2 and kw.lower() in title:
+            return kw
 
-    headings = conn.execute(
-        """
-        SELECT title FROM du_section_tree
-        WHERE document_id = ? AND level = 1
-        ORDER BY start_block_index
-        LIMIT 3
-        """,
-        (document_id,),
-    ).fetchall()
+    # First multi-word keyword
+    for kw in keywords:
+        if len(kw.split()) >= 2:
+            return kw
 
-    heading_texts = [
-        h["title"] for h in headings
-        if h["title"] and not _is_structural_heading(h["title"])
-    ][:2]
-
-    if heading_texts:
-        return f"{title}. Kapitel: {', '.join(heading_texts)}."
-    return title
+    return keywords[0] if keywords else None
 
 
 def _topic_from_title(
     conn: sqlite3.Connection,
     document_id: str,
 ) -> str | None:
-    """Fallback: use the document title."""
+    """Last resort: use the document title."""
+    title = _get_title(conn, document_id)
+    if title:
+        # Strip subtitle after colon if very long
+        if len(title) > 80 and ":" in title:
+            title = title.split(":")[0].strip()
+        return title
+    return None
+
+
+# ── Database helpers ──────────────────────────────────────────────────────────
+
+def _get_gnd_ids(conn: sqlite3.Connection, document_id: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT identifier_value FROM document_identifiers "
+        "WHERE document_id = ? AND identifier_type = 'gnd'",
+        (document_id,),
+    ).fetchall()
+    return [r["identifier_value"] for r in rows]
+
+
+def _get_title(conn: sqlite3.Connection, document_id: str) -> str | None:
     row = conn.execute(
         "SELECT title FROM documents WHERE document_id = ?",
         (document_id,),
     ).fetchone()
-    if row and row["title"]:
-        return row["title"].strip()
-    return None
+    return row["title"] if row else None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _get_keywords(conn: sqlite3.Connection, document_id: str) -> list[str]:
+    row = conn.execute(
+        "SELECT keywords FROM documents WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()
+    if not row or not row["keywords"]:
+        return []
+    try:
+        return json.loads(row["keywords"])
+    except (json.JSONDecodeError, TypeError):
+        return []
 
-def _first_sentence(text: str) -> str | None:
-    """Extract the first sentence from a text block.
-
-    Also handles the common case where letter-spaced text loses its
-    first character ('HE FOUNDATION' → likely 'THE FOUNDATION').
-    """
-    text = " ".join(text.split())
-
-    # Heuristic: if text starts with a lowercase-like fragment after
-    # letter-spacing normalization, prepend likely missing capital
-    # e.g. 'HE FOUNDATION' → DU lost 'T'
-    # We can't reliably recover the missing letter, so we just
-    # clean up and use what we have.
-
-    match = re.search(r'[.!?](?:\s|$)', text)
-    if match and match.start() > 20:
-        sentence = text[:match.start() + 1].strip()
-        if len(sentence.split()) >= 8:
-            return sentence
-    if len(text.split()) >= 15:
-        return text[:200].strip()
-    return None
-
-
-def _is_metadata_text(text: str) -> bool:
-    """True if text looks like metadata rather than content."""
-    lower = text.lower()
-    # Normalize unicode quotes for pattern matching
-    normalized = (text
-        .replace('\u2018', "'").replace('\u2019', "'")
-        .replace('\u201c', '"').replace('\u201d', '"')
-        .replace('\u2032', "'"))
-
-    patterns = [
-        r'^\d+\s*$',                            # page numbers
-        r'^vol\.\s*\d+',                         # volume info
-        r'doi:\s*10\.',                          # DOI
-        r'issn\s*[\d-]',                        # ISSN
-        r'©\s*\d{4}',                           # copyright
-        r'^(figure|fig\.|table|tab\.)',          # captions
-        r'^\w+\s+\d{4};\s*\d+',                # journal citation format
-        r"[A-Za-z].{0,40},\s*['\"]",           # author, 'Title' citation
-        r'content\s*©',                          # content copyright
-        r'all rights reserved',                  # rights statement
-        r'made available for.*research',         # access statement
-        r'digitised by',                         # digitisation note
-        r'extracted from',                       # extraction note
-        r'may be reproduced',                    # copyright disclaimer
-        r'no part of this',                      # copyright disclaimer
-        r'stored in a retrieval',                # copyright disclaimer
-        r'new series\s+\d+',                     # journal series ref
-        r'book of the',                          # journal title ref
-    ]
-    text_to_check = normalized.lower()
-    for pattern in patterns:
-        if re.search(pattern, text_to_check):
-            return True
-
-    # Caption pattern: "Term, description. Proper noun" without full sentences
-    # e.g. "Niederdeutsches Hallenhaus, Schaubild und Grundriss. Hof Große-..."
-    words = text.split()
-    if len(words) >= 5:
-        # High ratio of proper nouns / capitalized words suggests caption
-        cap_ratio = sum(1 for w in words if w and w[0].isupper()) / len(words)
-        # Very short lines (average < 4 words per line) suggest caption layout
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        avg_words_per_line = len(words) / max(len(lines), 1)
-        if cap_ratio > 0.6 and avg_words_per_line < 5 and len(words) < 30:
-            return True
-
-    digit_ratio = sum(1 for c in text if c.isdigit()) / max(len(text), 1)
-    return digit_ratio > 0.25
-
-
-def _is_structural_heading(text: str) -> bool:
-    """True if heading is structural rather than thematic."""
-    structural = {
-        "references", "bibliography", "appendix", "acknowledgements",
-        "contents", "index", "abstract", "introduction", "conclusion",
-        "literatur", "anhang", "einleitung", "zusammenfassung",
-    }
-    return text.lower().strip().rstrip('.') in structural
-
-
-def _clean_topic(topic: str) -> str:
-    """Normalise whitespace and strip edge artefacts."""
-    topic = " ".join(topic.split())
-    topic = topic.strip('.,;:')
-    return topic[:500]  # hard cap
-
-
-# ── Database and graph writes ─────────────────────────────────────────────────
 
 def _write_topic(
     conn: sqlite3.Connection,
@@ -344,7 +286,7 @@ def _write_topic(
         )
         conn.commit()
     except Exception as exc:
-        log.debug("Could not write topic (run atlas dev db migrate): %s", exc)
+        log.debug("Could not write topic: %s", exc)
 
 
 def _write_topic_triple(store, document_id: str, topic: str) -> None:
