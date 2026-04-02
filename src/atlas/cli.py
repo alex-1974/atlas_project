@@ -267,6 +267,10 @@ def inspect(
     if doc.get("pipeline_error"):
         console.print(f"  [red]Fehler:[/red]  {doc['pipeline_error'][:200]}")
 
+    # Topic
+    if doc.get("topic"):
+        console.print(f"  Topic:    {doc['topic'][:120]}")
+
     # Keywords (aus SQLite)
     if doc.get("keywords"):
         try:
@@ -638,8 +642,10 @@ def enrich(
     doc_id:       str  = typer.Argument(None,  help="Dokument-ID (leer = alle)"),
     all_docs:     bool = typer.Option(False, "--all",               help="Alle Dokumente"),
     do_keywords:  bool = typer.Option(False, "--keywords",          help="Keywords via YAKE (lokal, schnell)"),
-    do_kw_sem:    bool = typer.Option(False, "--keywords-semantic",  help="Keywords via KeyBERT (semantisch, langsamer)"),
-    do_themes:    bool = typer.Option(False, "--themes",             help="Themen via RVK + Wikidata"),
+    do_kw_sem:    bool = typer.Option(False, "--keywords-semantic",  help="Keywords via KeyBERT (semantisch)"),
+    do_topic:     bool = typer.Option(False, "--topic",             help="Topic-Satz extrahieren (extractive)"),
+    do_sec_kw:    bool = typer.Option(False, "--section-keywords",  help="Keywords pro Kapitel (YAKE)"),
+    do_themes:    bool = typer.Option(False, "--themes",            help="Themen via RVK + Wikidata"),
     do_gnd:       bool = typer.Option(False, "--gnd",               help="GND-Entitäten via lobid.org"),
     do_crossref:  bool = typer.Option(False, "--crossref",          help="CrossRef (braucht Netz)"),
     do_wikidata:  bool = typer.Option(False, "--wikidata",          help="Wikidata (braucht Netz)"),
@@ -672,8 +678,10 @@ def enrich(
         return
 
     # Ohne explizite Flags: YAKE-Keywords lokal
-    run_keywords     = do_keywords or not any([do_crossref, do_wikidata, do_rvk, do_kw_sem, do_themes, do_gnd])
+    run_keywords     = do_keywords or not any([do_crossref, do_wikidata, do_rvk, do_kw_sem, do_themes, do_gnd, do_topic, do_sec_kw])
     run_kw_semantic  = do_kw_sem
+    run_topic        = do_topic
+    run_sec_kw       = do_sec_kw
     run_themes       = do_themes
     run_gnd          = do_gnd
 
@@ -688,6 +696,42 @@ def enrich(
 
         if not as_json:
             console.print(f"  [dim]{name}[/dim]")
+
+        if run_topic:
+            try:
+                from atlas.enrich.topic import extract_topic
+                topic = extract_topic(conn, did, force=True)
+                entry["topic"] = topic
+                if topic and not as_json:
+                    console.print(f"    Topic: {topic[:80]}")
+                elif not topic and not as_json:
+                    console.print("    Topic: nicht gefunden")
+            except Exception as exc:
+                entry["topic_error"] = str(exc)
+                if not as_json:
+                    console.print(f"    [yellow]Topic: {exc}[/yellow]")
+
+        if run_sec_kw:
+            try:
+                from atlas.enrich.section_keywords import extract_section_keywords
+                sec_kws = extract_section_keywords(conn, did, force=True)
+                entry["section_keywords"] = len(sec_kws)
+                if sec_kws and not as_json:
+                    console.print(f"    Kapitel-Keywords: {len(sec_kws)} Sektionen")
+                    # Show first 3 sections as sample
+                    sections = conn.execute(
+                        "SELECT section_node_id, title FROM du_section_tree "
+                        "WHERE document_id = ? ORDER BY start_block_index LIMIT 3",
+                        (did,),
+                    ).fetchall()
+                    for s in sections:
+                        kws = sec_kws.get(s["section_node_id"], [])
+                        if kws:
+                            console.print(f"      {s['title'][:35]}: {', '.join(kws[:3])}")
+            except Exception as exc:
+                entry["section_keywords_error"] = str(exc)
+                if not as_json:
+                    console.print(f"    [yellow]Kapitel-Keywords: {exc}[/yellow]")
 
         if run_keywords:
             from atlas.enrich.keywords import extract_keywords

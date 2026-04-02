@@ -350,16 +350,26 @@ def _build_document_text(
     conn: sqlite3.Connection,
     document_id: str,
 ) -> tuple[str, str]:
-    """Build a representative text string for keyword extraction.
+    """Build a representative text string for document-level keyword extraction.
 
     Returns (text, language_code).
-    - Title and headings weighted by repetition
-    - Body sampled (first 60 blocks)
-    - page_furniture and noise blocks excluded
-    - Letter-spaced text normalized to readable form
+
+    Input strategy (most important → least important):
+        1. Explicit abstract text (3x weight)
+        2. Title (3x weight)
+        3. First 15 body blocks on pages 0-2 (introduction / lead text)
+        4. L1/L2 headings (2x weight)
+
+    Explicitly EXCLUDED:
+        - page_furniture and noise blocks
+        - References / back matter
+        - Blocks beyond page 2 (unless no earlier content found)
+
+    This keeps document keywords focused on what the document IS,
+    not on every topic it touches.
     """
     doc_row = conn.execute(
-        "SELECT title, language FROM documents WHERE document_id = ?",
+        "SELECT title, abstract, language FROM documents WHERE document_id = ?",
         (document_id,),
     ).fetchone()
 
@@ -371,36 +381,66 @@ def _build_document_text(
             lang_map = {"de": "de", "fr": "fr", "nl": "nl", "it": "it",
                         "es": "es", "pt": "pt", "en": "en"}
             lang = lang_map.get((doc_row["language"] or "en")[:2], "en")
+
+        # Title 3x — most reliable topic signal
         if doc_row["title"]:
-            # Title 3x — most reliable topic signal
             parts.extend([doc_row["title"]] * 3)
 
-    # L1/L2 headings (2x weight) — normalized
+        # Abstract 3x if available
+        if doc_row["abstract"] and len(doc_row["abstract"].split()) >= 10:
+            parts.extend([doc_row["abstract"]] * 3)
+
+    # L1/L2 headings (2x weight) — skip structural headings
+    # Period-terminated to prevent YAKE from creating phantom bigrams
+    # across section title boundaries ('Stimmen Historische' etc.)
+    _STRUCTURAL = {
+        "references", "bibliography", "appendix", "acknowledgements",
+        "contents", "index", "literatur", "anhang", "einleitung",
+        "introduction", "conclusion", "zusammenfassung",
+    }
     headings = conn.execute(
         "SELECT title FROM du_section_tree WHERE document_id = ? AND level <= 2",
         (document_id,),
     ).fetchall()
     for h in headings:
-        if h["title"]:
-            parts.extend([h["title"]] * 2)
+        if h["title"] and h["title"].lower().strip() not in _STRUCTURAL:
+            title = h["title"].rstrip(".") + ". "
+            parts.extend([title] * 2)
 
-    # Body blocks — exclude furniture and noise
-    body_blocks = conn.execute(
+    # First 15 body blocks on pages 0-2 (introduction / lead text)
+    # This is where the document topic is established
+    intro_blocks = conn.execute(
         """
         SELECT b.text FROM du_blocks b
         JOIN du_block_roles r ON r.block_id = b.block_id
-        WHERE b.document_id = ? AND r.role IN ('body', 'heading', 'caption')
-        ORDER BY b.block_index LIMIT 80
+        WHERE b.document_id = ? AND r.role = 'body' AND b.page_index <= 2
+        ORDER BY b.block_index LIMIT 15
         """,
         (document_id,),
     ).fetchall()
-    for b in body_blocks:
+
+    for b in intro_blocks:
         text = (b["text"] or "").strip()
         if not text:
             continue
-        # Normalize letter-spaced text ('C A S T L E  H I L L' → 'CASTLE HILL')
         text = _normalize_text(text)
         parts.append(text)
+
+    # If nothing from pages 0-2, fall back to first 15 body blocks anywhere
+    if len(parts) <= 6:
+        fallback = conn.execute(
+            """
+            SELECT b.text FROM du_blocks b
+            JOIN du_block_roles r ON r.block_id = b.block_id
+            WHERE b.document_id = ? AND r.role = 'body'
+            ORDER BY b.block_index LIMIT 15
+            """,
+            (document_id,),
+        ).fetchall()
+        for b in fallback:
+            text = (b["text"] or "").strip()
+            if text:
+                parts.append(_normalize_text(text))
 
     return " ".join(parts), lang
 
