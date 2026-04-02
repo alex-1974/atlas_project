@@ -1,143 +1,205 @@
-# Atlas — Literature Knowledge Base
+# Atlas
 
-Atlas is a research tool for building a structured knowledge base from large collections of scientific PDFs. It ingests documents, extracts text and metadata, identifies persistent identifiers (DOI, ISBN, ISSN, URN), and provides searchable text segments for exploration.
-
-The system is designed for local research workflows, reproducible data processing, and incremental enrichment of document metadata.
-
-Typical use case:
-
-* maintain a curated library of PDFs
-* extract machine-readable knowledge from them
-* search the corpus efficiently
-* identify related literature
-
-Atlas is currently used to support research pipelines such as the **BVILLAGE historical architecture project**.
+Atlas ist ein lokales Werkzeug zur Verwaltung, Erschließung und Erkundung
+wissenschaftlicher und historischer PDF-Sammlungen. Es läuft vollständig
+offline, braucht keinen Server und keine Cloud-Dienste.
 
 ---
 
-# Architecture
+## Wozu Atlas?
 
-Atlas processes documents in a deterministic pipeline:
+Wer größere Mengen an PDFs sammelt – wissenschaftliche Aufsätze, historische
+Archivdokumente, Berichte, Bücher – steht vor einem strukturellen Problem:
+Die Dokumente sind vorhanden, aber nicht erschlossen. Titel und Autoren
+stehen irgendwo im PDF, aber nicht zuverlässig in Metadaten. Querverweise
+zwischen Dokumenten existieren als Fließtext, aber nicht als maschinenlesbare
+Beziehungen. Volltextsuche findet Wörter, aber nicht Konzepte.
 
-discover
-↓
-register
-↓
-extract-text
-↓
-extract-metadata
-↓
-extract-identifiers
-↓
-normalize-identifiers
-↓
-dedupe-identifiers
-↓
-enrich-title-text
-↓
-enrich-title-filename
-↓
-enrich-quality
-↓
-mark-ocr-candidates
-↓
-segment-paragraphs
-↓
-search
-
-Each stage is implemented as an independent module and exposed via the CLI.
+Atlas löst dieses Problem lokal, ohne externe Dienste, ohne Datenweitergabe.
 
 ---
 
-# Project Structure
+## Was Atlas tut
 
-atlas/
+Ein Dokument durchläuft beim Hinzufügen zur Sammlung eine vollständige
+Verarbeitungskette:
 
-cli.py — Command line interface
-config.py — Configuration loading
+**Extraktion** – Text, Metadaten, Identifier (DOI, arXiv, ISBN) werden
+aus dem PDF gelesen.
 
-db/ — Database connection and migrations
+**Document Understanding** – Das Dokument wird geometrisch und typografisch
+analysiert. Jeder Textblock bekommt eine semantische Rolle (Titel, Autor,
+Überschrift, Fließtext, Referenz, ...). Kapitelstruktur, Zonen und
+Dokumenttyp werden erkannt.
 
-ingest/ — Document discovery and registration
+**Indexierung** – Drei Indexschichten werden befüllt:
+SQLite für strukturierte Abfragen und Volltextsuche,
+Oxigraph für Beziehungen im Wissensgraph,
+LanceDB für semantische Ähnlichkeitssuche.
 
-extract/ — Text and metadata extraction
-
-enrich/ — Metadata enrichment heuristics
-
-normalize/ — Identifier normalization
-
-segment/ — Text segmentation
-
-search/ — Corpus search
-
-inspect/ — Diagnostics and corpus inspection
-
-util/ — Small utilities
+**Erschließung** – Keywords, Topic und bibliografische Klassifikation
+werden lokal (YAKE) oder über externe Quellen (GND, RVK, Wikidata,
+CrossRef) angereichert. Alles optional, alles explizit.
 
 ---
 
-# Requirements
+## Schnellstart
 
-Python 3.12+
-PostgreSQL
-pdftotext (poppler-utils)
+```bash
+# Katalog anlegen
+cd ~/meine-literatur
+atlas init
 
----
+# PDFs indexieren
+atlas add paper.pdf
+atlas add ./ordner/ --resume
 
-# Installation
+# Suchen
+atlas search "Hallenhaus Westfalen"
+atlas find --type article --year 2020-2024
+atlas similar 48feef86              # semantisch ähnliche Dokumente
 
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# Erschließen (braucht Netz)
+atlas enrich --keywords             # YAKE lokal
+atlas enrich --gnd --topic          # GND + Topic über lobid.org
+atlas enrich --rvk                  # RVK-Klassifikation
 
----
-
-# Database
-
-ATLAS_CONFIG=atlas.yaml python -m atlas.cli migrate
-
----
-
-# Typical Workflow
-
-atlas discover
-atlas register
-
-atlas extract-text
-atlas extract-metadata
-
-atlas extract-identifiers
-atlas normalize-identifiers
-atlas dedupe-identifiers
-
-atlas enrich-title-text
-atlas enrich-title-filename
-atlas enrich-quality
-atlas mark-ocr-candidates
-
-atlas segment-paragraphs
-
-atlas search-docs "half timbered house joinery"
+# Erkunden
+atlas inspect 48feef86              # Einzeldokument detail
+atlas refs 48feef86                 # Referenznetzwerk
+atlas graph --author "Robin Tait"   # Co-Autoren
+atlas concept "Fachwerkbau"         # Konzept-Suche
+```
 
 ---
 
-# Current Capabilities
+## Kernkonzepte
 
-* PDF text extraction
-* metadata extraction
-* identifier mining
-* heuristic title detection
-* OCR candidate detection
-* paragraph segmentation
-* TF-IDF search
+### Katalog
+
+Der Katalog ist eine lokale Sammlung von PDFs in einem Ordner.
+Er wird durch `atlas init` initialisiert und speichert alle Daten
+im Unterordner `.atlas/`. Ein Nutzer kann mehrere unabhängige Kataloge
+führen (z.B. einen für Fachliteratur, einen für Archivmaterial).
+Eine globale Registry in `~/.atlas/` verwaltet alle bekannten Kataloge.
+
+### Dokument-Lebenszyklus
+
+```
+atlas add <pdf>
+    → Extraktion → DU → Keywords → Indexierung (SQLite + LanceDB + Oxigraph)
+
+atlas update
+    → erkennt neue PDFs im Katalogordner, verarbeitet sie nach
+
+atlas remove <id>
+    → entfernt das Dokument sauber aus allen Indexschichten
+
+atlas enrich <id>
+    → reichert mit externen Quellen an (GND, RVK, Wikidata, CrossRef)
+```
+
+### Drei Indexschichten
+
+Atlas nutzt drei komplementäre Speichersysteme, die gemeinsam mehr
+leisten als jedes einzeln:
+
+| Schicht | Technologie | Fragetyp |
+|---|---|---|
+| Strukturiert | SQLite + FTS5 | „Alle Aufsätze von Autor X aus 2018–2022" |
+| Relational | Oxigraph (RDF) | „Welche Dokumente zitiert dieses Paper?" |
+| Semantisch | LanceDB | „Welche Dokumente behandeln ähnliche Themen?" |
+
+### Document Understanding
+
+Atlas versteht nicht nur den Text eines Dokuments, sondern seine Struktur.
+Die DU-Pipeline analysiert jeden Block geometrisch (Position, Größe, Abstände),
+typografisch (Schriftart, Größe, Fettdruck) und semantisch (was bedeutet
+dieser Block im Dokumentkontext?). Das Ergebnis ist ein strukturiertes
+Modell des Dokuments mit Kapitelbaum, Zonen (Titelei, Body, Backmatter)
+und semantischen Rollen pro Block.
+
+→ Details: [`ARCHITECTURE-DU-PIPELINE.md`](./ARCHITECTURE-DU-PIPELINE.md)
+
+### Wissensgraph
+
+Beziehungen zwischen Dokumenten – Zitationen, gemeinsame Autoren,
+verwandte Konzepte – werden als RDF-Tripel in Oxigraph gespeichert
+und über SPARQL abfragbar gemacht. Der Graph wächst mit der Sammlung.
+
+→ Details: [`ARCHITECTURE-KNOWLEDGE-GRAPH.md`](./ARCHITECTURE-KNOWLEDGE-GRAPH.md)
+
+### Erschließung
+
+Atlas trennt zwischen automatischer Basiserschließung (`atlas add`)
+und expliziter Anreicherung (`atlas enrich`):
+
+| Zeitpunkt | Was | Kommando |
+|---|---|---|
+| `atlas add` | Keywords via YAKE (lokal, kein Netz) | automatisch |
+| `atlas enrich` | GND-Entitäten (lobid.org) | `--gnd` |
+| `atlas enrich` | Topic (GND-normalisiert) | `--topic` |
+| `atlas enrich` | Section-Keywords pro Kapitel | `--section-keywords` |
+| `atlas enrich` | RVK-Klassifikation | `--rvk` |
+| `atlas enrich` | Wikidata QID + ORCID | `--wikidata` |
+| `atlas enrich` | Vollständige Metadaten via DOI | `--crossref` |
 
 ---
 
-# Project Status
+## Unterstützte Dokumenttypen
 
-Atlas is stable for medium-sized research corpora.
+- Wissenschaftliche Aufsätze (Journal Articles, Konferenzbeiträge)
+- Monographien und Buchkapitel
+- Hochschulschriften (Dissertationen, Masterarbeiten)
+- Historische Archivdokumente (auch gescannt)
+- Technische Berichte und Working Papers
+- Mehrsprachige Korpora (EN, DE — weitere Sprachen ohne Anpassung möglich)
 
-Future work focuses on semantic search, citation graphs and automatic topic classification.
+---
 
-See **DEV_ROADMAP.md**.
+## Technologie-Stack
 
+| Komponente | Technologie |
+|---|---|
+| Sprache | Python 3.12+ |
+| CLI | Typer + Rich |
+| Datenbank | SQLite (mit FTS5) |
+| Wissensgraph | Oxigraph (pyoxigraph 0.5) |
+| Vektorsuche | LanceDB |
+| Embedding-Modell | `all-MiniLM-L6-v2` (lokal, offline nach erstem Download) |
+| PDF-Verarbeitung | PyMuPDF |
+| Keyword-Extraktion | YAKE + optional KeyBERT |
+| Spracherkennung | lingua (offline) |
+| GND-Erschließung | lobid.org API |
+| RVK-Klassifikation | rvk.uni-regensburg.de API |
+
+---
+
+## Aktueller Stand
+
+Phase 1 (März 2026) und Phase 2 (April 2026) sind abgeschlossen.
+Testkorpus: 5 Dokumente (EN + DE), Ergebnisse:
+
+| Metrik | Wert |
+|---|---|
+| Dokumenttyp-Genauigkeit | 100% |
+| Titel-Extraktion | 100% |
+| Autoren-Extraktion | 57% |
+| Section-Tree F1 | 54% |
+| Semantische Ähnlichkeit EN→EN | 0.595 |
+| LanceDB Chunks | 2116 |
+| Wissensgraph Tripel | 658 |
+
+→ Roadmap: [`ROADMAP.md`](./ROADMAP.md)
+
+---
+
+## Verwandte Dokumente
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — Modulstruktur, Abhängigkeiten, Ingestion-Pipeline
+- [`ARCHITECTURE-DU-PIPELINE.md`](./ARCHITECTURE-DU-PIPELINE.md) — Document-Understanding-Pipeline
+- [`ARCHITECTURE-KNOWLEDGE-GRAPH.md`](./ARCHITECTURE-KNOWLEDGE-GRAPH.md) — Wissensgraph, Oxigraph, SPARQL
+- [`ARCHITECTURE-EMBEDDINGS.md`](./ARCHITECTURE-EMBEDDINGS.md) — LanceDB, Chunk-Strategie, atlas similar
+- [`DATABASE.md`](./DATABASE.md) — SQLite-Schema, Migrationen, Erschließungsspalten
+- [`CLI.md`](./CLI.md) — Vollständige CLI-Referenz
+- [`ROADMAP.md`](./ROADMAP.md) — Entwicklungsphasen und offene Entscheidungen
