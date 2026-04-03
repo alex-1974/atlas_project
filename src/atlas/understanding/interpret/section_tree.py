@@ -206,7 +206,7 @@ def _final_level(h: dict, zone: str, style_levels: dict) -> int:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def compute_section_tree(conn: sqlite3.Connection, document_id: str) -> None:
+def compute_section_tree(conn: sqlite3.Connection, document_id: str, ocr_mode: bool = False) -> None:
     """Build the section hierarchy from heading candidates and zones.
 
     Strategy:
@@ -227,6 +227,26 @@ def compute_section_tree(conn: sqlite3.Connection, document_id: str) -> None:
     conn.commit()
 
     raw_headings = _fetch_headings(conn, document_id)
+
+    # OCR mode: keep only high-confidence candidates to prevent the
+    # section-tree explosion caused by OCR word-boxes scoring as headings.
+    if ocr_mode:
+        import re as _re
+        def _ocr_heading_ok(h: dict) -> bool:
+            if (h.get("heading_score") or 0.0) < 0.60:
+                return False
+            text = (h.get("text") or "").strip()
+            words = text.split()
+            # Single short token that is not a real word (e.g. "ASOAL")
+            if len(words) == 1 and len(text) <= 6:
+                return False
+            # Titelseiten-Stempel: ≤ 2 Wörter auf den ersten 3 Seiten
+            page = h.get("page_index") or 0
+            if len(words) <= 2 and page < 3:
+                return False
+            return True
+        raw_headings = [h for h in raw_headings if _ocr_heading_ok(h)]
+
     zone_map     = _fetch_zone_map(conn, document_id)
     title_ids    = _fetch_title_block_ids(conn, document_id)
 

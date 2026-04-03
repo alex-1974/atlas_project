@@ -24,6 +24,16 @@ Execution order (mirrors ARCHITECTURE-DU-PIPELINE.md):
     zones                 interpret/zones.py
     headings              interpret/headings.py     (needs zones)
     section_tree          interpret/section_tree.py (needs headings + zones)
+
+Source-kind adaptive behaviour
+------------------------------
+After build_document, source_kind is read from du_documents:
+
+  born_digital_pdf  — full pipeline, all signals active
+  ocr_scan          — full pipeline, headings/section_tree use
+                      stricter thresholds (OCR geometry is unreliable)
+  image_pdf         — Layer 1+2 run, Layer 3 skipped entirely
+                      (no meaningful signals without a text layer)
 """
 from __future__ import annotations
 
@@ -47,6 +57,14 @@ from atlas.understanding.interpret.section_tree import compute_section_tree
 from atlas.understanding.interpret.document_type import compute_document_type
 
 
+def _read_source_kind(conn: sqlite3.Connection, document_id: str) -> str:
+    row = conn.execute(
+        "SELECT source_kind FROM du_documents WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()
+    return row["source_kind"] if row else "born_digital_pdf"
+
+
 def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     """Run the complete DU pipeline for one document.
 
@@ -61,9 +79,13 @@ def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     Returns True if blocks were found and processing completed,
     False if the document has no layout data yet.
     """
-    # Segmentation — must run first; all other steps read du_blocks
+    # Segmentation — must run first; classifies source_kind
     if not build_document(conn, document_id):
         return False
+
+    source_kind = _read_source_kind(conn, document_id)
+    is_ocr      = source_kind == "ocr_scan"
+    is_image    = source_kind == "image_pdf"
 
     # Layer 1 — order matters: geometry before spacing/context,
     # topology before furniture
@@ -79,23 +101,25 @@ def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     # Layer 2
     compute_signals(conn, document_id)
 
+    # image_pdf: no reliable text layer → skip Layer 3 entirely
+    if is_image:
+        return True
+
     # Layer 3 — Pass 1: roles without document type adjustment
     compute_roles(conn, document_id)
     compute_consensus(conn, document_id)
     compute_zones(conn, document_id)
-    compute_headings(conn, document_id)
-    compute_section_tree(conn, document_id)
+    compute_headings(conn, document_id, ocr_mode=is_ocr)
+    compute_section_tree(conn, document_id, ocr_mode=is_ocr)
 
     # Document type detection — uses roles + section tree from Pass 1
     compute_document_type(conn, document_id)
 
     # Layer 3 — Pass 2: recompute roles with document type adjustments
-    # This resolves the chicken-and-egg: type is now known, roles benefit
-    # from type-specific signal adjustments.
     compute_roles(conn, document_id)
     compute_consensus(conn, document_id)
     compute_zones(conn, document_id)
-    compute_headings(conn, document_id)
-    compute_section_tree(conn, document_id)
+    compute_headings(conn, document_id, ocr_mode=is_ocr)
+    compute_section_tree(conn, document_id, ocr_mode=is_ocr)
 
     return True
