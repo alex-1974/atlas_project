@@ -19,16 +19,39 @@ _DOI = (
     "doi:", "doi.org/", "https://doi.org/", "http://doi.org/",
 )
 _THESIS = (
+    # Explicit document type labels (highest confidence)
     "thesis", "dissertation", "doctoral thesis", "doctoral dissertation",
     "phd thesis", "ph.d.", "doctor of philosophy",
-    "master thesis", "masterarbeit", "diplomarbeit", "doktorarbeit",
-    "habilitationsschrift", "submitted to", "in partial fulfillment",
-    "for the degree of", "zur erlangung", "inaugural-dissertation",
+    "master thesis", "masterarbeit", "diplomarbeit", "magisterarbeit",
+    "doktorarbeit", "habilitationsschrift", "inaugural-dissertation",
+    "mémoire", "thèse", "proefschrift", "tesi di dottorato",
+    "tesi di laurea", "masterscriptie",
+    # Degree-conferral statements (universal across institutions/languages)
+    "in partial fulfillment", "submitted in partial",
+    "for the degree of", "for the requirements of",
+    "zur erlangung", "zur erlangung des grades",
+    "zur erlangung der würde", "zur erlangung des akademischen",
+    "pour l'obtention", "pour l'obtention du grade",
+    "ter verkrijging van de graad",
+    # Supervisor/committee markers (only appear in theses)
+    "betreuer:", "erstbetreuer:", "zweitbetreuer:",
+    "erstgutachter:", "zweitgutachter:", "gutachter:",
+    "supervisor:", "co-supervisor:", "thesis advisor:",
+    "dissertation advisor:", "committee chair:",
+    "directeur de thèse:", "promotor:",
+    "approved by:", "submitted to",
 )
 _UNIVERSITY = (
     "university", "faculty", "department", "school of", "college of",
     "graduate school", "universität", "fakultät", "institut für",
     "department of",
+)
+
+# Supervisor/committee markers — subset of _THESIS for targeted use
+_SUPERVISOR = (
+    "betreuer", "gutachter", "supervisor", "committee chair",
+    "directeur de thèse", "promotor", "approved by",
+    "dissertation advisor", "thesis advisor",
 )
 _REPORT = (
     "report", "guidance", "guideline", "white paper",
@@ -45,7 +68,7 @@ def _has(text: str, needles: tuple[str, ...]) -> bool:
 
 
 def detect_early_meta_signals(
-    blocks: list[dict], limit: int = 10
+    blocks: list[dict], limit: int = 6
 ) -> dict[str, int | bool]:
     """Return document-type signals derived from the first `limit` blocks.
 
@@ -69,17 +92,30 @@ def detect_early_meta_signals(
         if _has(low, _REPORT):        report    += 1
         if len(text.split()) <= 14:   short     += 1
 
+    # Count supervisor/committee markers separately for thesis detection
+    supervisor = sum(
+        1 for block in blocks[:limit]
+        for needle in _SUPERVISOR
+        if needle in _norm(block.get("text") or "")
+    )
+
     return {
         "journal_meta_count":        journal,
         "doi_count":                 doi,
         "thesis_marker_count":       thesis,
         "university_marker_count":   university,
+        "supervisor_marker_count":   supervisor,
         "report_marker_count":       report,
         "short_line_count":          short,
         "strong_journal_header":     bool(doi >= 1 and journal >= 1),
         "very_strong_journal_header": bool(doi >= 1 and journal >= 2),
+        # strong_thesis_header requires explicit evidence:
+        # - an explicit thesis type label or degree-conferral statement, OR
+        # - a supervisor/committee marker (only appears in theses), OR
+        # - university >= 2 AND no journal/DOI signals (weak fallback)
         "strong_thesis_header":      bool(
             thesis >= 1
-            or (university >= 1 and doi == 0 and journal == 0)
+            or supervisor >= 1
+            or (university >= 2 and doi == 0 and journal == 0)
         ),
     }

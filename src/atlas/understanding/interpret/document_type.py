@@ -98,13 +98,17 @@ class ArticleProfile(DocumentTypeProfile):
         if meta.get("has_references"):               s += 0.15
         if meta.get("two_column_hint"):              s += 0.30
         if meta.get("has_keywords"):                 s += 0.10
-        if meta.get("page_count", 999) <= 60:        s += 0.10
+        pages = meta.get("page_count", 999)
+        if pages <= 60:                              s += 0.10
+        # Short doc without TOC and without thesis markers: likely article
+        if pages <= 30 and not meta.get("has_toc") and not meta.get("strong_thesis_header"):
+                                                     s += 0.15
         if (meta.get("two_column_hint")
-                and meta.get("page_count", 999) <= 30
+                and pages <= 30
                 and not meta.get("has_toc")):        s += 0.25
         if meta.get("strong_thesis_header"):         s -= 0.35
         if meta.get("has_toc"):                      s -= 0.15
-        if meta.get("page_count", 0) > 100:          s -= 0.25
+        if pages > 100:                              s -= 0.25
         return max(0.0, s)
 
     def adjust_block_scores(self, block, scores, weight=1.0):
@@ -147,6 +151,9 @@ class MonographProfile(DocumentTypeProfile):
         if meta.get("strong_journal_header"):        s -= 0.30
         if meta.get("strong_thesis_header"):         s -= 0.15
         if meta.get("two_column_hint"):              s -= 0.10
+        # Section explosion: glossaries/dictionaries have many short sections
+        # per page — not a typical monograph structure
+        if meta.get("sections_per_page", 0) > 2:    s -= 0.30
         return max(0.0, s)
 
     def adjust_block_scores(self, block, scores, weight=1.0):
@@ -160,14 +167,27 @@ class ThesisProfile(DocumentTypeProfile):
 
     def score(self, meta: dict) -> float:
         s = 0.0
-        if meta.get("strong_thesis_header"):         s += 0.50
-        if meta.get("university_marker_count", 0) >= 2: s += 0.30
+        has_thesis = meta.get("strong_thesis_header", False)
+        has_abs    = meta.get("has_abstract", False)
+        univ       = meta.get("university_marker_count", 0)
+        supervisor = meta.get("supervisor_marker_count", 0)
+
+        if has_thesis:                               s += 0.55
+        if supervisor >= 1:                          s += 0.20
+        # University alone is a weak signal — many non-thesis documents
+        # (exhibition catalogues, institutional reports, lecture notes)
+        # contain university names. Only score when combined with
+        # corroborating evidence.
+        if univ >= 2 and (has_thesis or has_abs or supervisor >= 1):
+                                                     s += 0.20
         if meta.get("has_toc"):                      s += 0.20
         if meta.get("page_count", 0) > 80:           s += 0.15
-        if meta.get("has_abstract"):                 s += 0.10
+        if has_abs:                                  s += 0.10
         if meta.get("strong_journal_header"):        s -= 0.35
-        if meta.get("doi_count", 0) >= 1 and not meta.get("strong_thesis_header"):
+        if meta.get("doi_count", 0) >= 1 and not has_thesis:
                                                      s -= 0.10
+        # Section explosion is not consistent with thesis structure
+        if meta.get("sections_per_page", 0) > 2:    s -= 0.40
         return max(0.0, s)
 
 
@@ -277,10 +297,10 @@ def _build_meta(conn: sqlite3.Connection, document_id: str) -> dict:
     )
 
     blocks_raw = conn.execute(
-        "SELECT text FROM du_blocks WHERE document_id = ? ORDER BY block_index LIMIT 15",
+        "SELECT text FROM du_blocks WHERE document_id = ? ORDER BY block_index LIMIT 6",
         (document_id,),
     ).fetchall()
-    early_meta = detect_early_meta_signals([dict(r) for r in blocks_raw], limit=15)
+    early_meta = detect_early_meta_signals([dict(r) for r in blocks_raw])
 
     page_count = conn.execute(
         "SELECT COUNT(*) FROM du_pages WHERE document_id = ?", (document_id,)
@@ -305,6 +325,13 @@ def _build_meta(conn: sqlite3.Connection, document_id: str) -> dict:
         "SELECT COALESCE(MAX(level), 0) FROM du_section_tree WHERE document_id = ?",
         (document_id,),
     ).fetchone()[0]
+    section_count = conn.execute(
+        "SELECT COUNT(*) FROM du_section_tree WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()[0]
+    # sections_per_page > 2 indicates a glossary, index, or dictionary —
+    # not a typical monograph or thesis chapter structure
+    sections_per_page = section_count / max(1, page_count)
 
     total_blocks = conn.execute(
         "SELECT COUNT(*) FROM du_blocks WHERE document_id = ?", (document_id,)
@@ -358,6 +385,8 @@ def _build_meta(conn: sqlite3.Connection, document_id: str) -> dict:
         "has_references":      has_references,
         "has_keywords":        has_keywords,
         "heading_depth":       heading_depth,
+        "section_count":       section_count,
+        "sections_per_page":   sections_per_page,
         "two_column_hint":     two_column_hint,
         "single_column_hint":  single_column_hint,
         "high_noise_ratio":    high_noise_ratio,
