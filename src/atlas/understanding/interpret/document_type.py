@@ -160,13 +160,24 @@ class ThesisProfile(DocumentTypeProfile):
 
     def score(self, meta: dict) -> float:
         s = 0.0
-        if meta.get("strong_thesis_header"):         s += 0.50
-        if meta.get("university_marker_count", 0) >= 2: s += 0.30
+        has_thesis = meta.get("strong_thesis_header", False)
+        has_abs    = meta.get("has_abstract", False)
+        univ       = meta.get("university_marker_count", 0)
+        supervisor = meta.get("supervisor_marker_count", 0)
+
+        if has_thesis:                               s += 0.55
+        if supervisor >= 1:                          s += 0.20
+        # University alone is a weak signal — many non-thesis documents
+        # (exhibition catalogues, institutional reports, lecture notes)
+        # contain university names. Only score when combined with
+        # corroborating evidence.
+        if univ >= 2 and (has_thesis or has_abs or supervisor >= 1):
+                                                     s += 0.20
         if meta.get("has_toc"):                      s += 0.20
         if meta.get("page_count", 0) > 80:           s += 0.15
-        if meta.get("has_abstract"):                 s += 0.10
+        if has_abs:                                  s += 0.10
         if meta.get("strong_journal_header"):        s -= 0.35
-        if meta.get("doi_count", 0) >= 1 and not meta.get("strong_thesis_header"):
+        if meta.get("doi_count", 0) >= 1 and not has_thesis:
                                                      s -= 0.10
         return max(0.0, s)
 
