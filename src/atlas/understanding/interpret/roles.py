@@ -17,6 +17,7 @@ from atlas.understanding.core.section_labels import (
     REFERENCE_HEADINGS, ABSTRACT_HEADINGS, APPENDIX_HEADINGS,
 )
 from atlas.understanding.core.text_patterns import is_formula_label
+from atlas.understanding.core.titelei_words import TITELEI_WORDS as _TITELEI_WORDS
 from atlas.understanding.interpret.document_type import apply_type_adjustments, BlockScores
 from atlas.core.fuzzy import (
     for_ as _for, fnot as _fnot,
@@ -52,22 +53,7 @@ def _caps_ratio(text: str) -> float:
 # ── Text classifiers (local — heavier than text_patterns, role-aware) ────────
 
 # Words that look like titles typographically (short, prominent, first page)
-# but are structural document elements, never the document title itself.
-# Multilingual — covers DE/EN/FR/AT academic and publishing conventions.
-_TITELEI_WORDS = {
-    # Document type labels
-    "diplomarbeit", "masterarbeit", "dissertation", "doktorarbeit",
-    "habilitationsschrift", "bachelorarbeit", "thesis", "abstract",
-    # Structural markers
-    "vorwort", "preface", "foreword", "impressum", "imprint",
-    "inhaltsverzeichnis", "contents", "table of contents",
-    "acknowledgements", "danksagung", "widmung", "dedication",
-    "zusammenfassung", "summary", "kurzfassung", "résumé",
-    "einleitung", "introduction", "anhang", "appendix",
-    # Publisher / series markers
-    "band", "volume", "heft", "teil", "part", "issue",
-    "herausgegeben", "edited by", "verfasst von",
-}
+
 
 def _sentence_like(text: str) -> bool:
     if _wc(text) < 6:

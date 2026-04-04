@@ -46,6 +46,12 @@ class Node:
     # ── Furniture flags ───────────────────────────────────────────────────────
     first_page_meta_like: bool
 
+    # ── Derived title-page signal ─────────────────────────────────────────────
+    # True if this block is on a page that looks like a title page:
+    # page 0 or 1, few blocks, no running text.
+    # More robust than first_page_meta_like which only fires for journals.
+    is_title_page_block: bool = False
+
     # ── Graph-corrected scores (None = not yet corrected) ─────────────────────
     graph_title_like:   float | None = None
     graph_heading_like: float | None = None
@@ -154,6 +160,30 @@ def build_graph(conn: sqlite3.Connection, document_id: str) -> DocumentGraph:
     gaps = [float(r["whitespace_after"]) for r in rows if r["whitespace_after"]]
     median_gap = statistics.median(gaps) if gaps else 1.0
 
+    # Compute per-page statistics for title-page detection
+    from collections import defaultdict
+    page_blocks: dict[int, list] = defaultdict(list)
+    for r in rows:
+        page_blocks[r["page_index"]].append(r)
+
+    def _is_title_page(page_idx: int) -> bool:
+        blocks = page_blocks.get(page_idx, [])
+        if page_idx > 1:
+            return False
+        if len(blocks) > 15:
+            return False
+        avg_body = (
+            sum(float(b["body_like"]) for b in blocks) / len(blocks)
+            if blocks else 1.0
+        )
+        return avg_body < 0.25
+
+    title_pages = {
+        page_idx
+        for page_idx in page_blocks
+        if _is_title_page(page_idx)
+    }
+
     nodes: list[Node] = []
     for r in rows:
         node = Node(
@@ -175,6 +205,7 @@ def build_graph(conn: sqlite3.Connection, document_id: str) -> DocumentGraph:
             is_letter_spaced=bool(r["is_letter_spaced"]),
             whitespace_after=float(r["whitespace_after"]),
             first_page_meta_like=bool(r["first_page_meta_like"]),
+            is_title_page_block=(r["page_index"] in title_pages),
         )
         nodes.append(node)
 

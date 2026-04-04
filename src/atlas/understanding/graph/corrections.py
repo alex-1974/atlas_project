@@ -80,9 +80,9 @@ def R01_title_continuation(graph: DocumentGraph) -> None:
         # and only on page 0 with first_page_meta context
         if node.title_like < 0.55:
             continue
-        if node.page_index > 0:
+        if not node.is_title_page_block:
             continue
-        if not node.first_page_meta_like:
+        if not node.is_title_page_block:
             continue
         # Skip blocks already corrected by this rule (prevent chain reactions)
         if node.graph_title_like is not None:
@@ -92,9 +92,9 @@ def R01_title_continuation(graph: DocumentGraph) -> None:
                 continue
             if not edge.source_text_continues:
                 continue
-            if edge.vertical_gap_ratio > 1.2:
+            if edge.vertical_gap_ratio > 50.0:
                 continue
-            if not (0.75 <= edge.font_ratio <= 1.30):
+            if not (0.65 <= edge.font_ratio <= 1.50):
                 continue
             if not edge.same_page:
                 continue
@@ -102,13 +102,13 @@ def R01_title_continuation(graph: DocumentGraph) -> None:
             if target is None:
                 continue
             # Target must be on page 0 or 1 maximum
-            if target.page_index > 1:
+            if not target.is_title_page_block:
                 continue
             # Target must not already be boosted (no chain reactions)
             if target.graph_title_like is not None:
                 continue
             # Don't boost if target already looks like a strong heading
-            if target.heading_like > target.title_like + 0.20:
+            if target.heading_like > target.title_like + 0.35:
                 continue
             _boost(target, "graph_title_like", 0.25, rule)
             # Also dampen heading_like so title wins in _resolve_role
@@ -129,7 +129,7 @@ def R02_sequence_position(graph: DocumentGraph) -> None:
     for node in graph.nodes:
         if node.doc_y_ratio <= 0.20:
             continue
-        if node.first_page_meta_like:
+        if node.is_title_page_block:
             continue
         if node.title_like < 0.30:
             continue
