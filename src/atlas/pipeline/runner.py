@@ -114,12 +114,32 @@ def _promote_du_metadata(conn: sqlite3.Connection, document_id: str) -> None:
 
     # Title from DU
     if not current_title or _is_corrupt(current_title):
-        title_rows = conn.execute(
+        # Schmutztitel detection: if page 0 has no body text, it is a
+        # cover/series title page. Skip page 0 title blocks and start
+        # the title search from page 1.
+        p0_body = conn.execute(
             """
+            SELECT AVG(s.body_like) AS avg_body, COUNT(*) AS block_count
+            FROM du_blocks b
+            JOIN du_block_signals s ON s.block_id = b.block_id
+            WHERE b.document_id = ? AND b.page_index = 0
+            """,
+            (document_id,),
+        ).fetchone()
+        has_schmutztitel = (
+            p0_body is not None
+            and (p0_body["avg_body"] or 0.0) < 0.15
+            and (p0_body["block_count"] or 0) <= 6
+        )
+        title_page_filter = "AND b.page_index >= 1" if has_schmutztitel else ""
+
+        title_rows = conn.execute(
+            f"""
             SELECT b.text, b.block_index, b.page_index
             FROM du_block_roles r
             JOIN du_blocks b ON b.block_id = r.block_id
             WHERE b.document_id = ? AND r.role = 'title'
+            {title_page_filter}
             ORDER BY b.block_index
             LIMIT 6
             """,

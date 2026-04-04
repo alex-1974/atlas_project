@@ -51,6 +51,24 @@ def _caps_ratio(text: str) -> float:
 
 # ── Text classifiers (local — heavier than text_patterns, role-aware) ────────
 
+# Words that look like titles typographically (short, prominent, first page)
+# but are structural document elements, never the document title itself.
+# Multilingual — covers DE/EN/FR/AT academic and publishing conventions.
+_TITELEI_WORDS = {
+    # Document type labels
+    "diplomarbeit", "masterarbeit", "dissertation", "doktorarbeit",
+    "habilitationsschrift", "bachelorarbeit", "thesis", "abstract",
+    # Structural markers
+    "vorwort", "preface", "foreword", "impressum", "imprint",
+    "inhaltsverzeichnis", "contents", "table of contents",
+    "acknowledgements", "danksagung", "widmung", "dedication",
+    "zusammenfassung", "summary", "kurzfassung", "résumé",
+    "einleitung", "introduction", "anhang", "appendix",
+    # Publisher / series markers
+    "band", "volume", "heft", "teil", "part", "issue",
+    "herausgegeben", "edited by", "verfasst von",
+}
+
 def _sentence_like(text: str) -> bool:
     if _wc(text) < 6:
         return False
@@ -111,6 +129,9 @@ def _strong_title_line(text: str) -> bool:
     if wc < 2 or wc > 18:
         return False
     if _sentence_like(text) or text.endswith("."):
+        return False
+    # Structural document elements are never the document title
+    if text.strip().lower() in _TITELEI_WORDS:
         return False
     caps = _caps_ratio(text)
     # All-caps titles
@@ -387,6 +408,11 @@ def compute_roles(conn: sqlite3.Connection, document_id: str) -> None:
         doc_y = _f(block.get("doc_y_ratio"))
         if doc_y > 0.15 and not furniture["first_page_meta_like"]:
             title_s = _fscale(title_s, 0.30)
+
+        # Structural document elements (Vorwort, Impressum, DIPLOMARBEIT, ...)
+        # are never the document title — dampen title strongly.
+        if low in _TITELEI_WORDS:
+            title_s = _fscale(title_s, 0.05)
 
         if _author_line_like(text):
             title_s   = _fscale(title_s,   0.55)

@@ -32,8 +32,22 @@ from pathlib import Path
 # ── Text normalisation ────────────────────────────────────────────────────────
 
 def _norm(text: str | None) -> str:
-    """Collapse whitespace, strip, lowercase."""
-    return " ".join((text or "").split()).strip().lower()
+    """Collapse whitespace, strip, lowercase, normalize unicode.
+
+    Maps umlauts and diacritics to ASCII equivalents so that
+    ground truth written in ASCII (e.g. "In grossen Hutten") matches
+    pipeline output with proper Unicode (e.g. "„In großen Hütten…“").
+    """
+    import unicodedata
+    t = (text or "")
+    # NFKD decomposition separates base characters from combining marks
+    t = unicodedata.normalize("NFKD", t)
+    # Drop combining characters (diacritics) — turns ü into u, ä into a etc.
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    # Strip typographic quotes and ellipsis characters
+    for ch in '„“‟”‛‘«»‹›…':
+        t = t.replace(ch, "")
+    return " ".join(t.split()).strip().lower()
 
 
 def _norm_title(text: str | None) -> str:
