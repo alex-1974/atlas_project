@@ -49,6 +49,7 @@ from atlas.understanding.measure.spacing import compute_spacing
 from atlas.understanding.measure.context import compute_context
 from atlas.understanding.measure.semantic_micro import compute_semantic_micro
 from atlas.understanding.aggregate.signals import compute_signals
+from atlas.understanding.graph import run_graph_corrections
 from atlas.understanding.interpret.roles import compute_roles
 from atlas.understanding.interpret.consensus import compute_consensus
 from atlas.understanding.interpret.zones import compute_zones
@@ -104,6 +105,9 @@ def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     # image_pdf: no reliable text layer → skip Layer 3 entirely
     if is_image:
         return True
+
+    # Layer 2.5 — neighbourhood graph score corrections
+    run_graph_corrections(conn, document_id)
 
     # Layer 3 — Pass 1: roles without document type adjustment
     compute_roles(conn, document_id)
