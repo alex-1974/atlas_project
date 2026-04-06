@@ -18,6 +18,9 @@ import json
 import sqlite3
 from typing import Any
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.zones")
+
 from atlas.understanding.core.vocab import Zone
 from atlas.understanding.core.section_labels import ALL_BACK_MATTER_HEADINGS
 
@@ -271,6 +274,10 @@ def compute_zones(conn: sqlite3.Connection, document_id: str) -> None:
     back_start = _detect_back_start(blocks, total)
     if back_start is not None and back_start <= body_start:
         back_start = None
+    _log.debug(
+        "zones doc=%s: total=%d body_font=%.1f body_start=%d back_start=%s",
+        document_id[:12], total, body_font, body_start, back_start,
+    )
 
     # Build block_index → zone mapping
     zone_map: dict[int, str] = {}

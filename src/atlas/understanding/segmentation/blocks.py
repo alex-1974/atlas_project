@@ -24,6 +24,9 @@ from __future__ import annotations
 import sqlite3
 import uuid
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.segmentation")
+
 from atlas.understanding.segmentation.block_segmentation import (
     InducedBlock,
     LayoutLine,
@@ -68,8 +71,16 @@ def _classify_source(conn: sqlite3.Connection,
     # A single outlier span (e.g. decorative chapter number at 200pt) with
     # avg_font near body size (< 20pt) is a born_digital PDF, not an OCR scan.
     if avg_x0_dev > 500 or (max_font > 100 and avg_font > 20):
+        _log.info(
+            "classify_source doc=%s: avg_x0=%.0f max_font=%.0f avg_font=%.1f → ocr_scan",
+            document_id[:12], avg_x0_dev, max_font, avg_font,
+        )
         return "ocr_scan", "ocr", 1, 0
 
+    _log.debug(
+        "classify_source doc=%s: spans=%d avg_x0=%.0f max_font=%.0f avg_font=%.1f → born_digital_pdf",
+        document_id[:12], row["span_count"], avg_x0_dev, max_font, avg_font,
+    )
     return "born_digital_pdf", "pdf_native", 1, 1
 
 
