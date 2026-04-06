@@ -43,6 +43,9 @@ Nothing else changes.
 """
 from __future__ import annotations
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.document_type")
+
 import json
 import sqlite3
 from abc import ABC, abstractmethod
@@ -413,6 +416,8 @@ def compute_document_type(conn: sqlite3.Connection, document_id: str) -> str:
     """
     meta = _build_meta(conn, document_id)
     raw  = {p.name: p.score(meta) for p in _REGISTRY}
+    _log.debug("document_type doc=%s scores=%s", document_id[:12],
+               {k: round(v, 3) for k, v in raw.items()})
     normalised = _normalise(raw)
 
     if not normalised:

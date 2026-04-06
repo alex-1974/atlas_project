@@ -22,6 +22,9 @@ import json
 import sqlite3
 from typing import Any
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.headings")
+
 from atlas.understanding.core.vocab import Zone
 from atlas.understanding.core.text_patterns import (
     is_reference_heading, is_appendix_heading, is_caption_like,
@@ -371,6 +374,11 @@ def compute_headings(conn: sqlite3.Connection, document_id: str,
         })
 
     candidates = _normalize_headings(candidates)
+    _log.debug("headings doc=%s: %d candidates (ocr_mode=%s)",
+               document_id[:12], len(candidates), ocr_mode)
+    if len(candidates) == 0:
+        _log.warning("headings doc=%s: 0 candidates — section tree will be empty",
+                     document_id[:12])
 
     conn.execute(
         "DELETE FROM du_heading_candidates WHERE block_id IN "
