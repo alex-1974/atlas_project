@@ -386,6 +386,13 @@ def run_pipeline(
             from atlas.db.connection import set_catalog_path
             set_catalog_path(catalog_root)
 
+        # ── Pass 0: Pre-classification ────────────────────────────────────
+        # Runs before any DU step. Determines book_score / structure_score
+        # and boost signals. The profile is passed to run_du_pipeline() so
+        # the Aggregate layer can apply quadrant-specific weights.
+        from atlas.pipeline.profiling import profile_document
+        profile = profile_document(Path(pdf_path))
+
         _set_status(conn, document_id, "extracting")
         _run_extract_text(catalog_root, document_id, pdf_path)
         _run_extract_metadata(catalog_root, document_id, pdf_path)
@@ -395,7 +402,7 @@ def run_pipeline(
 
         _set_status(conn, document_id, "du_processing")
         from atlas.understanding.pipeline import run_du_pipeline
-        run_du_pipeline(conn, document_id)
+        run_du_pipeline(conn, document_id, profile=profile)
         from atlas.pipeline.detect.language import run_detect_language
         run_detect_language(conn, document_id)
 
