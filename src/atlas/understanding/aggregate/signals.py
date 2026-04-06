@@ -23,11 +23,27 @@ Signals added vs. old system
 - alignment_center used in title_like
 - word_count used alongside char_count in body_like
 - author_like gated on name_signal (fixes Ortsname false positives)
+
+Profile-driven weights
+----------------------
+An optional DocumentProfile (from pipeline/profiling.py) can be passed
+to compute_signals().  This prepares the Aggregate layer for
+quadrant-specific weight optimisation via Ground Truth validation.
+
+Currently a stub — all quadrants use identical weights.
+Activation sequence:
+  1. Collect Ground Truth for all four quadrants.
+  2. Identify which weights diverge between quadrants.
+  3. Replace stub constants with _QUADRANT_WEIGHTS[quadrant].field.
 """
 from __future__ import annotations
 
 import re
 import sqlite3
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from atlas.pipeline.profiling import DocumentProfile
 
 from atlas.core.fuzzy import (
     fand, for_, fnot, fguard, fscale, fboost, fdampen, flinear, fmax,
@@ -79,8 +95,31 @@ def _name_signal(text: str | None) -> float:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
-    """Aggregate Layer 1 measurements into seven named scores per block."""
+def compute_signals(
+    conn: sqlite3.Connection,
+    document_id: str,
+    profile: "DocumentProfile | None" = None,
+) -> None:
+    """Aggregate Layer 1 measurements into seven named scores per block.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+    document_id : str
+    profile : DocumentProfile | None
+        Pre-classification result from Pass 0 (pipeline/profiling.py).
+        Currently a stub — quadrant is read but weights are not yet
+        differentiated.  Ground Truth validation will determine which
+        weights to vary per quadrant.
+    """
+    # ── Quadrant stub ─────────────────────────────────────────────────────────
+    # quadrant = profile.quadrant if profile is not None else "doc_structured"
+    #
+    # Quadrant-specific weights will be activated here after Ground Truth
+    # validation identifies which signals diverge between quadrants.
+    # For now all quadrants use identical weights — fully backwards compatible.
+    # ─────────────────────────────────────────────────────────────────────────
+
     rows = conn.execute(
         """
         SELECT
@@ -208,12 +247,8 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
         is_ref_hdr  = _b(r["is_references_marker"])
 
         cont_like   = _f(r["continuation_like"])
-        in_flow     = _f(r["in_flow_score"])  # 1.0=normal flow, 0.0=scattered
+        in_flow     = _f(r["in_flow_score"])
         para_gap    = r["paragraph_gap_before"]
-        # in_column: negative gap means block overlaps previous vertically
-        # — reliable indicator of multi-column layout.
-        # But very large negative values (< -50pt) are geometry artefacts
-        # (page breaks, images, large vertical jumps) not column context.
         in_column   = (1.0 if (para_gap is not None
                                 and _f(para_gap) < 0
                                 and _f(para_gap) > -50.0)
@@ -225,17 +260,12 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
 
         # ── Derived composite gates ───────────────────────────────────────
 
-        # Bold or notably larger than body font.
-        # Dampen for very small fonts (map labels, footnotes at bottom of
-        # font distribution) — bold 6pt is not a heading signal.
-        # sub_body_penalty is HIGH when font_pct is LOW (bottom 20%).
-        sub_body_penalty = fnot(flinear(font_pct, 0.0, 0.25))  # 1 at pct=0, 0 at pct≥0.25
+        sub_body_penalty = fnot(flinear(font_pct, 0.0, 0.25))
         typo_strong = fdampen(
             for_(bold, flinear(font_ratio, 1.05, 1.30)),
             fscale(sub_body_penalty, 0.90),
         )
 
-        # Font clearly larger than previous block
         font_jump = for_(
             larger_prev,
             flinear(delta_prev, 1.0, 4.0),
@@ -245,23 +275,12 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
         not_in_column  = fnot(in_column)
 
         # ── title_like ────────────────────────────────────────────────────
-        # Gate: block must be in the top tier of the document's font
-        # distribution.  font_percentile is document-agnostic: a 16pt
-        # title in a 9pt journal and a 72pt title in an illustrated report
-        # both score near 1.0.  Threshold: top ~15% of font sizes = title
-        # zone; top ~5% = strong title.
-        # Additionally: must be in front-matter context OR literally the
-        # largest on its page — prevents map labels that happen to be
-        # large in a small local context from becoming titles.
-        top_font_tier = flinear(font_pct, 0.82, 1.0)   # top 18% of doc fonts
+        top_font_tier = flinear(font_pct, 0.82, 1.0)
         truly_largest = for_(
             largest,
-            # Without being largest_on_page, require BOTH top font tier
-            # AND explicit first-page-meta marker (fp_meta, not just front_score).
-            # front_score is high for ALL early blocks and is not specific enough.
             fand(
-                fp_meta,                             # explicit metadata marker only
-                flinear(font_pct, 0.90, 1.0),        # strict: top 10% only
+                fp_meta,
+                flinear(font_pct, 0.90, 1.0),
             ),
         )
         layout_support = for_(
@@ -281,17 +300,10 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
         )
 
         # ── heading_like ──────────────────────────────────────────────────
-        # Typographically distinct: either font_percentile in heading zone
-        # (top 30–85% of doc fonts), OR bold, OR all-caps.
-        # The heading zone is the space between body text and titles.
         heading_font_zone = fand(
-            flinear(font_pct, 0.65, 0.85),  # above body, below title
-            fnot(top_font_tier),             # not in title tier
+            flinear(font_pct, 0.65, 0.85),
+            fnot(top_font_tier),
         )
-        # Non-body text color is a strong typographic signal — but only when
-        # the dominant text span itself carries the color (not a bullet glyph).
-        # Gate on font tier OR bold: a colored block at body font size without
-        # any other typographic distinction is ambiguous (sidebar text, links).
         color_gate = for_(top_font_tier, fscale(typo_strong, 0.70), fscale(float(bold), 0.60))
         color_signal = (
             fscale(color_gate, 0.85) if color_rank == 1 else
@@ -311,14 +323,7 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
             fand(short_line, not_in_column),
             ends_colon,
             fscale(full_wide, 0.40),
-            # Letter-spaced text is a strong typographic heading signal
-            # independent of column context.
             fscale(letter_spaced, 0.70),
-            # Bold + larger font + few words: reliable heading signal in
-            # column layouts where not_in_column is suppressed.
-            # font_ratio threshold starts at 1.05 — even modest size
-            # increases combined with bold are heading evidence.
-            # Scale 0.65 so that ratio=1.22, wc=4 gives heading_form≈0.40.
             fscale(fand(bold, flinear(font_ratio, 1.05, 1.40),
                         fnot(flinear(word_count, 8, 20))), 0.65),
         )
@@ -331,20 +336,9 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
             fdampen(1.0, fscale(cont_like, 0.80)),
         )
 
-        # Chapter/section number prefix is one of the most reliable heading
-        # signals in structured documents ("1.1 INTRODUCTION", "3.4.6 Beam
-        # Design"). Boost heading_like when present — but only if there is
-        # already some typographic signal (typo_distinct > 0), so that a
-        # numbered line in body font does not become a heading.
         if has_chap_num and typo_distinct > 0.10:
             heading_like = fboost(heading_like, 0.25)
 
-        # Bold + significantly larger font + short text: boost heading_like
-        # directly. In column layouts (not_in_column=0) the heading_form gate
-        # suppresses the base signal; this boost allows genuine bold subheadings
-        # to break through even when heading_like would otherwise be near zero.
-        # Guard: typo_distinct > 0 (prevents body-font bold from firing) and
-        # word_count <= 8 (prevents bold table headers from firing).
         bold_large_font = (
             bold > 0.5
             and font_ratio > 1.10
@@ -356,7 +350,6 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
             heading_like = fboost(heading_like, 0.35)
 
         # ── body_like ─────────────────────────────────────────────────────
-        # Substantial length AND sentence structure OR flows from context.
         length_signal = for_(
             flinear(char_count, 60, 200),
             flinear(word_count, 12, 40),
@@ -375,13 +368,10 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
             fscale(body_score,  0.70),
         )
         body_like = fdampen(body_like, fscale(repeated, 0.80))
-        # Letter-spaced text is a typographic heading device — it is almost
-        # never body text. Dampen body_like strongly for letter-spaced blocks.
         if letter_spaced:
             body_like = fscale(body_like, 0.15)
 
         # ── author_like ───────────────────────────────────────────────────
-        # GATED: without a name-specific signal the score is 0.
         name_gate  = _name_signal(text)
         positional = fand(short_line, fnot(ends_dot), fnot(has_doi))
         ctx_sup    = for_(fp_meta, fscale(front_score, 0.60))
@@ -391,14 +381,12 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
         )
 
         # ── reference_like ────────────────────────────────────────────────
-        # Explicit markers dominate. Soft signals require some length —
-        # short lines (captions, credits) should not score as references.
-        long_enough = flinear(word_count, 6, 15)   # references tend to be longer
+        long_enough = flinear(word_count, 6, 15)
         ref_explicit = for_(is_ref_hdr, fscale(has_doi, 0.90))
         ref_soft = for_(
             fscale(has_cit_br,  0.70),
             fscale(has_cit_ay,  0.70),
-            fscale(fand(has_year, long_enough), 0.35),   # year alone not enough
+            fscale(fand(has_year, long_enough), 0.35),
             fscale(back_score,  0.60),
             fscale(flinear(punct_dens, 0.06, 0.15), 0.35),
             fscale(italic,      0.30),
@@ -414,8 +402,6 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
         )) else 0.0
         toc_dots = 1.0 if (text.count(".") >= 4 and text[-1:].isdigit()) else 0.0
 
-        # Proximity to an image is a strong caption signal — but not for
-        # typographically strong blocks (bold headings next to images).
         near_image_caption = fscale(near_image, 0.80) * (1.0 - min(1.0, typo_strong))
         caption_like = for_(
             fscale(for_(is_fig, is_tbl), 0.95),
@@ -426,23 +412,10 @@ def compute_signals(conn: sqlite3.Connection, document_id: str) -> None:
             near_image_caption,
         )
 
-        # Image-adjacent blocks are unlikely to be section headings —
-        # UNLESS they are typographically strong (bold, larger font).
-        # A bold heading can legitimately appear next to an image.
-        # Gate the damping: only dampen if the block lacks strong typo signals.
         near_image_dampen = fscale(near_image, 0.95) * (1.0 - min(1.0, typo_strong))
         heading_like = fdampen(heading_like, near_image_dampen)
-
-        # Blocks inside colored background boxes are more likely sidebar/callout
-        # body text than section headings.
         heading_like = fdampen(heading_like, fscale(float(in_colored_box), 0.70))
 
-        # Blocks not in the normal vertical text flow (map labels, legend entries)
-        # should not become headings.  Two conditions must both hold:
-        # 1. narrow layout (not a full paragraph spanning the column)
-        # 2. font is NOT in the heading-size tier (fp < 0.65)
-        # A narrow block at body font size with negative/chaotic gap is a map label.
-        # A narrow block at heading font size with negative gap is a column-break heading.
         if narrow and font_pct < 0.65:
             heading_like = fand(heading_like, flinear(in_flow, 0.0, 0.50))
 

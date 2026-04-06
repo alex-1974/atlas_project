@@ -34,10 +34,23 @@ After build_document, source_kind is read from du_documents:
                       stricter thresholds (OCR geometry is unreliable)
   image_pdf         — Layer 1+2 run, Layer 3 skipped entirely
                       (no meaningful signals without a text layer)
+
+Profile-driven behaviour
+------------------------
+An optional DocumentProfile (from pipeline/profiling.py) can be passed
+to run_du_pipeline().  It is forwarded to compute_signals() where
+quadrant-specific weights are applied in the Aggregate layer.
+
+If no profile is provided the pipeline runs with default weights —
+fully backwards compatible.
 """
 from __future__ import annotations
 
 import sqlite3
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from atlas.pipeline.profiling import DocumentProfile
 
 from atlas.understanding.segmentation.blocks import build_document
 from atlas.understanding.measure.geometry import compute_geometry
@@ -66,7 +79,11 @@ def _read_source_kind(conn: sqlite3.Connection, document_id: str) -> str:
     return row["source_kind"] if row else "born_digital_pdf"
 
 
-def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
+def run_du_pipeline(
+    conn: sqlite3.Connection,
+    document_id: str,
+    profile: "DocumentProfile | None" = None,
+) -> bool:
     """Run the complete DU pipeline for one document.
 
     Assumes du_layout_lines and du_layout_spans are already populated
@@ -76,6 +93,15 @@ def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     document type detection and role assignment:
       Pass 1: compute signals + roles without type adjustment
       Pass 2: detect document type, then recompute roles with adjustments
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+    document_id : str
+    profile : DocumentProfile | None
+        Pre-classification result from Pass 0 (pipeline/profiling.py).
+        If provided, quadrant-specific weights are applied in the
+        Aggregate layer.  If None, default weights are used.
 
     Returns True if blocks were found and processing completed,
     False if the document has no layout data yet.
@@ -99,8 +125,8 @@ def run_du_pipeline(conn: sqlite3.Connection, document_id: str) -> bool:
     compute_context(conn, document_id)
     compute_semantic_micro(conn, document_id)
 
-    # Layer 2
-    compute_signals(conn, document_id)
+    # Layer 2 — profile forwarded for quadrant-specific weights
+    compute_signals(conn, document_id, profile=profile)
 
     # image_pdf: no reliable text layer → skip Layer 3 entirely
     if is_image:
