@@ -49,6 +49,9 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.pipeline")
+
 if TYPE_CHECKING:
     from atlas.pipeline.profiling import DocumentProfile
 
@@ -113,6 +116,7 @@ def run_du_pipeline(
     source_kind = _read_source_kind(conn, document_id)
     is_ocr      = source_kind == "ocr_scan"
     is_image    = source_kind == "image_pdf"
+    _log.info("pipeline doc=%s: source_kind=%s", document_id[:12], source_kind)
 
     # Layer 1 — order matters: geometry before spacing/context,
     # topology before furniture

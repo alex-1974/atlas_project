@@ -22,6 +22,9 @@ import json
 import sqlite3
 from typing import Any
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.headings")
+
 from atlas.understanding.core.vocab import Zone
 from atlas.understanding.core.text_patterns import (
     is_reference_heading, is_appendix_heading, is_caption_like,
@@ -259,8 +262,9 @@ def _filter_headings(headings: list[dict]) -> list[dict]:
             title_blob = (text[0].isupper() and text[1:].islower() and len(text) > 12)
             if lower_blob or title_blob:
                 continue
-        # OCR-Zeichenmüll: enthält nicht-ASCII oder Steuerzeichen
-        if any(ord(c) > 127 for c in text):
+        # OCR-Zeichenmüll: enthält Steuerzeichen (aber kein normales Unicode).
+        # ord > 127 war zu aggressiv — trifft geschweifte Apostrophe, Umlaute etc.
+        if any(ord(c) < 32 and c not in ('\t', '\n') for c in text):
             continue
         # Kurze Fragmente die einzelne Fließtextwörter sind
         # (z.B. "This", "Although", "Supervising") — ein Wort, erster Buchstabe groß,
@@ -272,16 +276,6 @@ def _filter_headings(headings: list[dict]) -> list[dict]:
         # Sehr kurze Großbuchstaben-Fragmente (z.B. "AND", "THE", "WITH")
         if (len(words) <= 2 and text.isupper() and len(text) <= 15
                 and float(score) < 0.90):
-            continue
-        # Satzanfangs-Fragmente: "The X", "His X", "For X", "In X" etc.
-        # Zwei Wörter, erstes ist Artikel/Pronomen/Präposition → Fließtext
-        _SENTENCE_STARTERS = {
-            "the", "a", "an", "his", "her", "its", "their", "our", "my",
-            "for", "in", "at", "on", "by", "of", "to", "not", "one",
-            "this", "that", "these", "those", "some", "both", "all",
-        }
-        if (len(words) == 2 and words[0].lower() in _SENTENCE_STARTERS
-                and words[1][0].islower()):
             continue
         # Satzanfangs-Fragmente: "The X", "His X", "For X", "In X" etc.
         # Zwei Wörter, erstes ist Artikel/Pronomen/Präposition → Fließtext
@@ -380,6 +374,11 @@ def compute_headings(conn: sqlite3.Connection, document_id: str,
         })
 
     candidates = _normalize_headings(candidates)
+    _log.debug("headings doc=%s: %d candidates (ocr_mode=%s)",
+               document_id[:12], len(candidates), ocr_mode)
+    if len(candidates) == 0:
+        _log.warning("headings doc=%s: 0 candidates — section tree will be empty",
+                     document_id[:12])
 
     conn.execute(
         "DELETE FROM du_heading_candidates WHERE block_id IN "

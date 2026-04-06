@@ -21,6 +21,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from atlas.core.logging import get_logger
+_log = get_logger("atlas.du.section_tree")
+
 from atlas.understanding.core.vocab import Zone
 from atlas.understanding.core.text_patterns import (
     is_reference_heading, is_appendix_heading, normalize,
@@ -355,6 +358,11 @@ def compute_section_tree(conn: sqlite3.Connection, document_id: str, ocr_mode: b
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
 
+    _log.debug("section_tree doc=%s: %d sections written",
+               document_id[:12], len(rows))
+    if len(rows) == 0:
+        _log.warning("section_tree doc=%s: 0 sections",
+                     document_id[:12])
     conn.commit()
 
     # ── TOC merge ─────────────────────────────────────────────────────────────

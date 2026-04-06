@@ -6,6 +6,10 @@ and early-meta context adjustments, writes du_block_roles.
 
 Bug 2 fix: early_meta key is 'strong_journal_header', not 'has_journal_meta'.
 All role constants come from vocab.Role — no local string literals.
+
+Fix: _heading_text_like() now uses first alphabetic character instead of
+text[0] for the uppercase check. This correctly identifies numbered headings
+like '1.1 Traditional Farmsteads' where text starts with a digit.
 """
 from __future__ import annotations
 
@@ -160,9 +164,15 @@ def _heading_text_like(text: str, font_size: float = 0.0,
         return True
     if wc <= 4:
         return True
-    # Longer headings: starts with capital + no sentence structure
-    # e.g. "Das Niederdeutsche Hallenhaus ist Bauernhaus des Jahres 2023"
-    if (text[0].isupper()
+    # Longer headings: use first alphabetic character for the uppercase check.
+    # text[0].isupper() fails for numbered headings like '1.1 Introduction'
+    # where the text starts with a digit, not a letter.
+    # Using the first alpha character correctly handles:
+    #   '1.1 Traditional Farmsteads'  → first alpha 'T' → isupper() True  ✓
+    #   '1.3 Farmstead layouts'       → first alpha 'F' → isupper() True  ✓
+    #   'introduction'                → first alpha 'i' → isupper() False ✗
+    first_alpha = next((c for c in text if c.isalpha()), None)
+    if (first_alpha and first_alpha.isupper()
             and not text.endswith((".", "?", "!"))
             and wc <= 14):
         return True
@@ -264,7 +274,7 @@ def _resolve_role(
                 and heading_score >= 0.15):
             return Role.HEADING
         if (heading_score >= 0.40
-                and body_score < 0.85
+                and body_score < 0.92
                 and heading_score >= title_score - 0.10
                 and heading_score >= noise_score):
             return Role.HEADING
