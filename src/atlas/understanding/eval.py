@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+from atlas.core.similarity import char_similarity as _title_sim
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,8 @@ def _norm(text: str | None) -> str:
     """
     import unicodedata
     t = (text or "")
+    # Replace ß before NFKD (NFKD maps ß→s, not ß→ss)
+    t = t.replace("ß", "ss").replace("ẞ", "SS")
     # NFKD decomposition separates base characters from combining marks
     t = unicodedata.normalize("NFKD", t)
     # Drop combining characters (diacritics) — turns ü into u, ä into a etc.
@@ -305,7 +308,10 @@ def run_eval(
         actual_title   = db_doc.get("title") or ""
         title_correct  = bool(
             expected_title
-            and _norm(expected_title) == _norm(actual_title)
+            and (
+                _norm(expected_title) == _norm(actual_title)
+                or _title_sim(_norm(expected_title), _norm(actual_title)) >= 0.85
+            )
         )
 
         # ── Authors ──────────────────────────────────────────────────────

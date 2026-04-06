@@ -17,6 +17,7 @@ from atlas.understanding.core.section_labels import (
     REFERENCE_HEADINGS, ABSTRACT_HEADINGS, APPENDIX_HEADINGS,
 )
 from atlas.understanding.core.text_patterns import is_formula_label
+from atlas.understanding.core.titelei_words import TITELEI_WORDS as _TITELEI_WORDS
 from atlas.understanding.interpret.document_type import apply_type_adjustments, BlockScores
 from atlas.core.fuzzy import (
     for_ as _for, fnot as _fnot,
@@ -52,22 +53,7 @@ def _caps_ratio(text: str) -> float:
 # ── Text classifiers (local — heavier than text_patterns, role-aware) ────────
 
 # Words that look like titles typographically (short, prominent, first page)
-# but are structural document elements, never the document title itself.
-# Multilingual — covers DE/EN/FR/AT academic and publishing conventions.
-_TITELEI_WORDS = {
-    # Document type labels
-    "diplomarbeit", "masterarbeit", "dissertation", "doktorarbeit",
-    "habilitationsschrift", "bachelorarbeit", "thesis", "abstract",
-    # Structural markers
-    "vorwort", "preface", "foreword", "impressum", "imprint",
-    "inhaltsverzeichnis", "contents", "table of contents",
-    "acknowledgements", "danksagung", "widmung", "dedication",
-    "zusammenfassung", "summary", "kurzfassung", "résumé",
-    "einleitung", "introduction", "anhang", "appendix",
-    # Publisher / series markers
-    "band", "volume", "heft", "teil", "part", "issue",
-    "herausgegeben", "edited by", "verfasst von",
-}
+
 
 def _sentence_like(text: str) -> bool:
     if _wc(text) < 6:
@@ -293,8 +279,12 @@ def _fetch_blocks(conn: sqlite3.Connection, document_id: str) -> list[dict]:
     return [dict(r) for r in conn.execute(
         """
         SELECT b.block_id, b.text, b.page_index,
-               s.title_like, s.heading_like, s.body_like, s.author_like,
-               s.reference_like, s.caption_like, s.noise_like,
+               COALESCE(s.graph_title_like,   s.title_like)   AS title_like,
+               COALESCE(s.graph_heading_like, s.heading_like) AS heading_like,
+               COALESCE(s.graph_body_like,    s.body_like)    AS body_like,
+               COALESCE(s.graph_author_like,  s.author_like)  AS author_like,
+               s.reference_like, s.caption_like,
+               COALESCE(s.graph_noise_like,   s.noise_like)   AS noise_like,
                f.running_header_like, f.running_footer_like,
                f.page_number_like, f.first_page_meta_like,
                t.bold, t.font_ratio, t.font_size,
