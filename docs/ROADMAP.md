@@ -47,6 +47,8 @@ Erschließung als vollständig nutzbare Features.
 - Wikidata-, CrossRef-, ORCID-Integration (implementiert, braucht Netz)
 - Migrationen 0012–0014 (keywords, subjects, topic, document_identifiers,
   du_section_keywords)
+- Strukturiertes Logging (`atlas.core.logging`, `ATLAS_LOG`-Umgebungsvariable)
+- DU-Pipeline-Fixes: OCR-Klassifikation, Zonengrenzen, nummerierte Headings
 
 **Bekannte Lücken:**
 - `all-MiniLM-L6-v2` englisch-dominant: deutsche Dokumente haben
@@ -54,6 +56,21 @@ Erschließung als vollständig nutzbare Features.
 - Keyword-Qualität begrenzt RVK-Treffsicherheit
 - `atlas search --semantic` (Fusion FTS5 + LanceDB) fehlt noch
 - Referenz-Parser für `cites`-Tripel fehlt noch
+
+**Erreichte Qualität (Testkorpus 21 Dokumente, April 2026):**
+
+| Metrik | Phase 1 | Phase 2 |
+|---|---|---|
+| Dokumenttyp-Genauigkeit | 100% | 85% |
+| Titel-Extraktion | 100% | 25% |
+| Autoren-Extraktion | 57% | 32% |
+| Section-Tree Precision | — | 13% |
+| Section-Tree Recall | — | 77% |
+| Section-Tree F1 | 54% | 23% |
+
+Hinweis: Phase-1-Zahlen basieren auf 5 Dokumenten, Phase-2-Zahlen auf
+21 Dokumenten mit erweitertem Ground-Truth-Korpus — direkte Vergleiche
+sind daher nur eingeschränkt aussagekräftig.
 
 ---
 
@@ -70,6 +87,11 @@ Erschließung als vollständig nutzbare Features.
 - Keyword-Qualität: MultipartiteRank (pke) als Alternative zu YAKE
 - Thesaurus-Boost: GND-Kandidaten in YAKE-Kandidaten höher gewichten
 - RVK-Qualität: Topic als primäre Suchanfrage statt YAKE-Keywords
+- Section precision verbessern: Formelblöcke (`Given:`, `Solution:`, `Answer:`)
+  werden fälschlich als Headings erkannt (Timber Manual: +228 extras)
+- Title accuracy verbessern: viele Dokumente ohne erkannten Titel (`actual=''`)
+- Laudel Dissertation: 0/8 Sections gefunden (Zonierungsproblem)
+- `runner.py`: Pass-0 DocumentProfile vollständig integrieren
 
 ---
 
@@ -89,6 +111,7 @@ Lücken aus Phase 1 und 2 schließen.
 - Verbesserte OCR-Pipeline für Archivdokumente
 - `atlas dev` auslagern oder entfernen
 - i18n: Section-Labels in `core/i18n/` statt hartkodierten Sets
+- Altes `src/atlas/document_understanding/` Verzeichnis entfernen
 
 ---
 
@@ -121,7 +144,7 @@ aber Institutionen und mehrteilige Namen werden oft falsch erkannt.
 ### OE-3: Dokumenttyp-Klassifikation ✓
 
 Regelbasiert über `early_meta`-Signale implementiert.
-Testkorpus: 100% Genauigkeit.
+Testkorpus: 100% Genauigkeit auf 5 Dokumenten, 85% auf 21 Dokumenten.
 
 ---
 
@@ -207,8 +230,11 @@ so gut wie der erste Schritt.
 - Mehrspaltige Layouts: `body_like`-Scores ohne `column_hint` weniger präzise
 - Letter-spaced Headings: erster Buchstabe geht bei Normalisierung verloren
 - Tabelleninhalte: als Blöcke segmentiert, nicht als strukturierte Tabellen
-- Mathematische Formeln: als Body-Text behandelt
+- Mathematische Formeln und Formelblöcke: als Headings fehlklassifiziert
+  (`Given:`, `Solution:`, `Answer:` — betrifft Timber Construction Manual)
 - Captions: werden gelegentlich als `body` klassifiziert
+- Titel: bei vielen Dokumenten kein Titelblock erkannt (`actual=''`)
+- Laudel Dissertation: 0/8 Sections durch Zonierungsproblem
 
 **Bekannte Schwächen der Erschließung:**
 - Mehrsprachige Ähnlichkeitssuche: englisch-dominant (OE-8)
@@ -222,10 +248,12 @@ so gut wie der erste Schritt.
 
 | Metrik | Phase 1 | Phase 2 | Ziel Phase 4 |
 |---|---|---|---|
-| Dokumenttyp-Genauigkeit | 100% | 100% | 100% |
-| Titel-Extraktion | 100% | 100% | 100% |
-| Autoren-Extraktion | 57% | 57% | 85% |
-| Section-Tree F1 | 54% | 54% | 0.80 |
+| Dokumenttyp-Genauigkeit | 100% | 85% | 95% |
+| Titel-Extraktion | 100% | 25% | 90% |
+| Autoren-Extraktion | 57% | 32% | 85% |
+| Section-Tree Precision | — | 13% | 0.70 |
+| Section-Tree Recall | — | 77% | 0.85 |
+| Section-Tree F1 | 54% | 23% | 0.75 |
 | Semantische Ähnlichkeit EN→EN | — | 0.595 | 0.70 |
 | Semantische Ähnlichkeit DE→EN | — | 0.30 | 0.55 (multilingual) |
 | Topic-Qualität (korrekt) | — | 60% | 85% |
