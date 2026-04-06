@@ -191,16 +191,44 @@ def _back_signal(block: dict, total: int) -> float:
 # ── Boundary detection ────────────────────────────────────────────────────────
 
 def _detect_body_start(blocks: list[dict], body_font: float) -> int:
-    last_front, seen_body = -1, False
-    early_limit = max(30, int(len(blocks) * 0.25))
+    """Detect where body content begins.
+
+    Strategy: find the first run of consecutive body-signal blocks.
+    A "run" is defined as N_BODY_RUN blocks within a window of
+    WINDOW_SIZE where body_signal >= BODY_THRESH.
+
+    This is more robust than tracking last_front because front_signal
+    is inflated by doc_y_ratio for all early blocks, causing the
+    boundary to be pushed too far into the document for reports and
+    articles that have minimal front matter.
+    """
+    BODY_THRESH  = 0.55
+    N_BODY_RUN   = 2    # consecutive body blocks needed
+    early_limit  = max(30, int(len(blocks) * 0.30))
+
+    run = 0
+    first_body_idx = -1
+
     for block in blocks:
         idx = _i(block.get("block_index"))
-        if idx > early_limit and seen_body:
+        if idx > early_limit:
             break
+        if _body_signal(block, body_font) >= BODY_THRESH:
+            if run == 0:
+                first_body_idx = idx
+            run += 1
+            if run >= N_BODY_RUN:
+                return first_body_idx
+        else:
+            run = 0
+            first_body_idx = -1
+
+    # Fallback: original strategy
+    last_front = -1
+    for block in blocks[:early_limit]:
+        idx = _i(block.get("block_index"))
         if _front_signal(block, body_font) >= 0.45:
             last_front = idx
-        if _body_signal(block, body_font) >= 0.55:
-            seen_body = True
     return max(0, last_front + 1)
 
 

@@ -368,6 +368,10 @@ def compute_signals(
             fscale(body_score,  0.70),
         )
         body_like = fdampen(body_like, fscale(repeated, 0.80))
+        # Extreme font_ratio (>5x body) indicates a decorative/graphic element.
+        # These blocks are not reliable body text — dampen body_like strongly.
+        if font_ratio > 5.0:
+            body_like = fdampen(body_like, 0.80)
         if letter_spaced:
             body_like = fscale(body_like, 0.15)
 

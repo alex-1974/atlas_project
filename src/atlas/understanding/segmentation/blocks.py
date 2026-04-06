@@ -59,11 +59,15 @@ def _classify_source(conn: sqlite3.Connection,
 
     avg_x0_dev = row["avg_x0_dev"] or 0.0
     max_font   = row["max_font"]   or 0.0
+    avg_font   = row["avg_font"]   or 0.0
 
     # OCR indicators:
     # - avg_x0_dev > 500: words scattered across page width (OCR word boxes)
     # - max_font > 100:   font_size is actually pixel height, not pt size
-    if avg_x0_dev > 500 or max_font > 100:
+    # OCR scans have chaotic x0 positions AND large font metrics throughout.
+    # A single outlier span (e.g. decorative chapter number at 200pt) with
+    # avg_font near body size (< 20pt) is a born_digital PDF, not an OCR scan.
+    if avg_x0_dev > 500 or (max_font > 100 and avg_font > 20):
         return "ocr_scan", "ocr", 1, 0
 
     return "born_digital_pdf", "pdf_native", 1, 1
