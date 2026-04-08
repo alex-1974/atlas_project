@@ -364,15 +364,17 @@ def _assign_levels(anchors: list[Anchor]) -> dict[int, list[Anchor]]:
             effective_level = num_level if num_level else level
             final.setdefault(effective_level, []).append(a)
 
-    # Pass 4: re-number levels starting at 1 (avoid L3/L4 when only
-    # one font class found — the first heading class is always L1)
-    if final:
+    # Pass 4: re-number levels starting at 1
+    # Only for unnumbered documents — numbered documents encode
+    # level in their numbering depth (1.2.3 = L3) and must not
+    # be renumbered.
+    has_numbering = any(_numbering_depth(a.text) for a in anchors)
+    if not has_numbering and final:
         sorted_levels = sorted(final.keys())
-        # Only renumber if levels don't start at 1
         if sorted_levels[0] != 1:
             offset = sorted_levels[0] - 1
-            final = {lvl - offset: anchors
-                     for lvl, anchors in final.items()}
+            final = {lvl - offset: alist
+                     for lvl, alist in final.items()}
     return final
 
 
@@ -574,6 +576,22 @@ def detect_anchors(
     )
 
     if not anchors:
+        return []
+
+    # Density gate: if anchors are too dense (>3 per page), this
+    # is likely a glossary, index, or list — not a structured text.
+    # Return empty patterns so the section tree stays empty.
+    page_count = conn.execute(
+        "SELECT COUNT(DISTINCT page_index) FROM du_blocks WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()[0] or 1
+    anchor_density = len(anchors) / page_count
+    if anchor_density > 3.0:
+        _log.info(
+            "anchor_detection doc=%s: density=%.1f anchors/page > 3.0 "
+            "— likely glossary/index, skipping patterns",
+            document_id[:12], anchor_density,
+        )
         return []
 
     # ── Assign levels and build patterns ──────────────────────────────────────
