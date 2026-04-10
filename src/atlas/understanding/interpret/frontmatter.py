@@ -168,6 +168,72 @@ def _update_role(
 
 # ── Prominence score ──────────────────────────────────────────────────────────
 
+
+# ── Metadata page detection ───────────────────────────────────────────────────
+
+_METADATA_MARKERS = {
+    "digitized by", "digitised by", "scanned by", "scanning center",
+    "google", "internet archive", "archive.org",
+    "university library", "bibliotheque nationale",
+    "all rights reserved", "no portion of this",
+}
+
+def _is_metadata_page(blocks: list[dict]) -> bool:
+    """True if this page is a digitization/copyright metadata page.
+
+    Such pages appear before the actual title page in scanned books
+    (Google Books, Internet Archive) and should be skipped when
+    searching for the title.
+    """
+    for b in blocks:
+        text = _norm(b.get("text")).lower()
+        if any(m in text for m in _METADATA_MARKERS):
+            return True
+    # Page with only very small text (< 9pt) → metadata or scan artefact
+    if blocks:
+        max_fs = max(_f(b.get("font_size")) for b in blocks)
+        if max_fs < 9.0:
+            return True
+    return False
+
+
+def _find_title_page(blocks: list[dict]) -> int | None:
+    """Find page_index of the title page within frontmatter blocks.
+
+    Title page = page with the single most prominent block,
+    after excluding pre-title metadata pages (digitization info,
+    copyright pages, scan artefacts).
+
+    For short frontmatter (1 page) this returns that page.
+    For long frontmatter, it finds the page where the main title
+    block lives — typically the page with the largest font block.
+    """
+    # Group blocks by page
+    pages: dict[int, list[dict]] = {}
+    for b in blocks:
+        p = _i(b.get("page_index"))
+        pages.setdefault(p, []).append(b)
+
+    if not pages:
+        return None
+
+    # Score each page by its most prominent block
+    page_scores: dict[int, float] = {}
+    for p, pblocks in sorted(pages.items()):
+        if _is_metadata_page(pblocks):
+            _log.debug("frontmatter: skipping metadata page %d", p)
+            continue
+        scores = [_prominence(b) for b in pblocks]
+        best = max(scores) if scores else 0.0
+        if best > 0:
+            page_scores[p] = best
+
+    if not page_scores:
+        return None
+
+    # Title page = page with the highest single-block prominence
+    return max(page_scores, key=lambda p: page_scores[p])
+
 def _prominence(block: dict) -> float:
     """Score for how prominent a block is as a title candidate.
 
@@ -245,7 +311,21 @@ def interpret_frontmatter(
 
     # ── Step 1: Find title block ──────────────────────────────────────────────
     # Title = highest prominence score, wc ≤ 18
-    scored = [(b, _prominence(b)) for b in blocks]
+    # Find title page first, then title block on that page
+    title_page = _find_title_page(blocks)
+    _log.debug("frontmatter doc=%s: title_page=%s",
+               document_id[:12], title_page)
+
+    # Score blocks — restrict to title page if found
+    if title_page is not None:
+        candidate_blocks = [
+            b for b in blocks
+            if _i(b.get("page_index")) == title_page
+        ]
+    else:
+        candidate_blocks = blocks
+
+    scored = [(b, _prominence(b)) for b in candidate_blocks]
     scored.sort(key=lambda x: -x[1])
 
     title_block = None
