@@ -70,6 +70,7 @@ from atlas.understanding.interpret.roles import compute_roles
 from atlas.understanding.interpret.consensus import compute_consensus
 from atlas.understanding.interpret.zones import compute_zones
 from atlas.understanding.interpret.headings import compute_headings
+from atlas.understanding.interpret.frontmatter import interpret_frontmatter
 from atlas.understanding.measure.typography_profile import build_typography_profile
 from atlas.understanding.interpret.anchor_detection import detect_anchors
 from atlas.understanding.interpret.section_tree import compute_section_tree
@@ -159,6 +160,8 @@ def run_du_pipeline(
     compute_headings(conn, document_id, ocr_mode=is_ocr,
                      patterns=heading_patterns, typography_profile=tp)
     compute_section_tree(conn, document_id, ocr_mode=is_ocr)
+    # Pass 3.0 — Frontmatter: title/author nach finalem roles-Pass
+    interpret_frontmatter(conn, document_id)
     return True
 
     # Layer 2.5 — neighbourhood graph score corrections
