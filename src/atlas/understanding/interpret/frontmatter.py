@@ -246,9 +246,14 @@ def _prominence(block: dict) -> float:
     center  = _f(block.get("centeredness"), 0.5)
     wc      = _i(block.get("word_count"))
 
-    # Filter artefacts: font_size > 100pt is a PDF artefact
-    # (symbol font, vector graphic text, etc.)
-    if fs <= 0 or fs > 100.0 or chars <= 0 or wc < 2:
+    # Filter artefacts: font_size > 300pt is almost certainly a PDF
+    # artefact (symbol font, vector path text). Values 100-300pt can
+    # be legitimate large title fonts on cover pages.
+    if fs <= 0 or fs > 300.0 or chars <= 0 or wc < 2:
+        return 0.0
+
+    # Letter-spaced blocks are journal/series titles, not document titles
+    if bool(block.get("is_letter_spaced")):
         return 0.0
 
     # Furniture is never title
