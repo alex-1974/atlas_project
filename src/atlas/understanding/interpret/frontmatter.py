@@ -278,24 +278,11 @@ def interpret_frontmatter(
     # Mark title block
     _update_role(conn, title_block["block_id"], Role.TITLE)
 
-    # ── Step 2: Find subtitle ─────────────────────────────────────────────────
-    # Subtitle = next prominent block directly after title, smaller font
+    # ── Step 2: Subtitle intentionally disabled ─────────────────────────────
+    # Subtitle detection causes more harm than good — it incorrectly
+    # merges chapter headings and running titles into the document title.
+    # Only the single most prominent block is marked as title.
     title_fs = _f(title_block.get("font_size"))
-    subtitle_found = False
-
-    for b in blocks:
-        if _i(b.get("block_index")) <= title_idx:
-            continue
-        fs = _f(b.get("font_size"))
-        wc = _i(b.get("word_count"))
-        if (0.5 * title_fs <= fs < title_fs
-                and wc >= 2 and wc <= 20
-                and not _is_titelei(_norm(b.get("text")))):
-            # Only first candidate
-            if not subtitle_found:
-                _update_role(conn, b["block_id"], Role.TITLE)
-                subtitle_found = True
-                break
 
     # ── Step 3: Assign authors ────────────────────────────────────────────────
     for b in blocks:
@@ -337,18 +324,8 @@ def _downgrade_frontmatter_headings(
         role = b.get("current_role") or ""
         if role == Role.HEADING:
             text = _norm(b.get("text"))
-            wc   = _i(b.get("word_count"))
-            fs   = _f(b.get("font_size"))
-            # Might be an undetected title (large, short, early)
-            if fs >= 14.0 and wc <= 15 and not _is_titelei(text):
-                _update_role(conn, b["block_id"], Role.TITLE)
-                _log.debug(
-                    "frontmatter doc: promoted heading→title: %s",
-                    text[:40],
-                )
-            else:
-                _update_role(conn, b["block_id"], Role.BODY)
-                _log.debug(
-                    "frontmatter doc: downgraded heading→body: %s",
-                    text[:40],
-                )
+            _update_role(conn, b["block_id"], Role.BODY)
+            _log.debug(
+                "frontmatter doc: downgraded heading→body: %s",
+                text[:40],
+            )
