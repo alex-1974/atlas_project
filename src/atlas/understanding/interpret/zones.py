@@ -193,21 +193,29 @@ def _back_signal(block: dict, total: int) -> float:
 
 # ── Boundary detection ────────────────────────────────────────────────────────
 
-def _detect_body_start(blocks: list[dict], body_font: float) -> int:
+def _detect_body_start(
+    blocks: list[dict],
+    body_font: float,
+    doc_type: str | None = None,
+) -> int:
     """Detect where body content begins.
 
-    Strategy: find the first run of consecutive body-signal blocks.
-    A "run" is defined as N_BODY_RUN blocks within a window of
-    WINDOW_SIZE where body_signal >= BODY_THRESH.
-
-    This is more robust than tracking last_front because front_signal
-    is inflated by doc_y_ratio for all early blocks, causing the
-    boundary to be pushed too far into the document for reports and
-    articles that have minimal front matter.
+    Parameters are tuned by document type:
+    - article/archival: short frontmatter, strict run requirement
+    - monograph/thesis: long frontmatter allowed
+    - report or unknown: medium frontmatter
     """
-    BODY_THRESH  = 0.55
-    N_BODY_RUN   = 2    # consecutive body blocks needed
-    early_limit  = max(30, int(len(blocks) * 0.30))
+    BODY_THRESH = 0.55
+    if doc_type in ("article", "archival"):
+        N_BODY_RUN = 4
+        early_limit = max(15, int(len(blocks) * 0.15))
+    elif doc_type in ("monograph", "thesis"):
+        N_BODY_RUN = 3
+        early_limit = max(60, int(len(blocks) * 0.25))
+    else:
+        N_BODY_RUN = 3
+        early_limit = max(40, int(len(blocks) * 0.20))
+
 
     run = 0
     first_body_idx = -1
@@ -270,7 +278,13 @@ def compute_zones(conn: sqlite3.Connection, document_id: str) -> None:
     body_font  = font_sizes[len(font_sizes) // 2] if font_sizes else 10.0
     total      = len(blocks)
 
-    body_start = _detect_body_start(blocks, body_font)
+    _dt = conn.execute(
+        "SELECT du_document_type FROM documents WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()
+    doc_type = _dt["du_document_type"] if _dt else None
+    _log.debug("zones doc=%s: doc_type=%s", document_id[:12], doc_type)
+    body_start = _detect_body_start(blocks, body_font, doc_type=doc_type)
     back_start = _detect_back_start(blocks, total)
     if back_start is not None and back_start <= body_start:
         back_start = None
