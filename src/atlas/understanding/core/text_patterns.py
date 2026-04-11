@@ -346,7 +346,9 @@ _CALC_NOUN_RE = re.compile(
     r'wind|combined|unbraced|horizontal|vertical|radial|lateral|'
     r'required|estimated|allowable|maximum|minimum|total|revised|'
     r'mid-?span|self-?weight|soffit|column|beam|connection|fastener|'
-    r'reference\s+design)',
+    r'reference\s+design|end|overload|post-?fire|post-?load|'
+    r'member|option|capacity|compression|tension|resistance|'
+    r'reinforcement|spacing|thickness|length|width|depth|height)',
     re.IGNORECASE,
 )
 
@@ -370,6 +372,10 @@ def is_formula_label(text: str | None) -> bool:
     Capped at 12 words to exclude long sentence-style labels.
     """
     t = " ".join((text or "").split()).strip()
+    # "EXAMPLE 3.5-1", "Example 2.3.1-1 Glulam Beam Shrinkage" etc.
+    import re as _re
+    if _re.match(r'^example\s+[\d][\d\.\-]+', t, _re.IGNORECASE):
+        return True
     if not t or not t.endswith(":"):
         return False
     words = t.split()

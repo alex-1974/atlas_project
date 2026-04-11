@@ -38,23 +38,19 @@ Erschließung als vollständig nutzbare Features.
 - Oxigraph-Wissensgraph (658 Tripel, `atlas refs`, `atlas graph`, `atlas concept`)
 - `atlas find` mit strukturierten Filtern
 - Keyword-Extraktion via YAKE (`atlas enrich --keywords`)
-  Input auf Titel + Abstract + Seiten 0–2 beschränkt
 - Topic-Extraktion via GND-Normalisierung (`atlas enrich --topic`)
-  Pipeline: GND-IDs → lobid.org preferred label → Keyword-Fallback
 - Section-Keywords via YAKE pro Kapitel (`atlas enrich --section-keywords`)
 - GND-Anreicherung via lobid.org (`atlas enrich --gnd`)
 - RVK-Klassifikation via rvk.uni-regensburg.de (`atlas enrich --rvk`)
 - Wikidata-, CrossRef-, ORCID-Integration (implementiert, braucht Netz)
-- Migrationen 0012–0014 (keywords, subjects, topic, document_identifiers,
-  du_section_keywords)
+- Migrationen 0012–0014
 - Strukturiertes Logging (`atlas.core.logging`, `ATLAS_LOG`-Umgebungsvariable)
-- DU-Pipeline-Fixes: OCR-Klassifikation, Zonengrenzen, nummerierte Headings
+- DU-Pipeline-Fixes: OCR-Klassifikation, Zonengrenzen, `_detect_title`-Fallback
 
 **Bekannte Lücken:**
-- `all-MiniLM-L6-v2` englisch-dominant: deutsche Dokumente haben
-  niedrige Ähnlichkeits-Scores (Stiewe: 0.27–0.30)
+- `all-MiniLM-L6-v2` englisch-dominant (Stiewe: 0.27–0.30)
 - Keyword-Qualität begrenzt RVK-Treffsicherheit
-- `atlas search --semantic` (Fusion FTS5 + LanceDB) fehlt noch
+- `atlas search --semantic` fehlt noch
 - Referenz-Parser für `cites`-Tripel fehlt noch
 
 **Erreichte Qualität (Testkorpus 21 Dokumente, April 2026):**
@@ -68,50 +64,60 @@ Erschließung als vollständig nutzbare Features.
 | Section-Tree Recall | — | 77% |
 | Section-Tree F1 | 54% | 23% |
 
-Hinweis: Phase-1-Zahlen basieren auf 5 Dokumenten, Phase-2-Zahlen auf
-21 Dokumenten mit erweitertem Ground-Truth-Korpus — direkte Vergleiche
-sind daher nur eingeschränkt aussagekräftig.
+Hinweis: Phase-1-Zahlen basieren auf 5 Dokumenten, Phase-2-Zahlen
+auf 21 Dokumenten — direkter Vergleich nur eingeschränkt aussagekräftig.
 
 ---
 
-### Phase 3 — Export & Qualität
+### Phase 3 — DU-Rewrite & Qualität (laufend)
 
-**Ziel:** Exportformate, Fusion-Suche, bessere Erschließungsqualität.
+**Ziel:** Dokumentverständnis auf solides Fundament stellen.
+Opportunistisch statt erzwingend: hochkonfidente Strukturerkennung
+wenn das Dokument es hergibt, robuste Basisextraktion wenn nicht.
 
-**Enthält:**
+**Leitprinzip:** Atlas versucht nicht, jedes Dokument vollständig zu
+verstehen. Ohne erkennbares Heading-Pattern bleibt der Section Tree
+leer — das ist korrekt. Reine Fließtexte werden als solche erkannt.
+
+**P1 — Titel-Extraktion reparieren (25% → 80%+)**
+Der wichtigste einzelne Qualitätswert. Direkte Auswirkung auf
+Katalognutzbarkeit.
+
+**P2 — DU-Pipeline dokumentrelativ machen**
+Neuer Ansatz: TypographyProfile + Anchor Detection + HeadingPattern.
+Absolute Schwellenwerte werden durch dokumentrelative Messungen ersetzt.
+Details → `ARCHITECTURE-DU-PIPELINE.md`.
+
+**P3 — Noise-Filter verbessern**
+Running Headers, Seitenzahlen, Formelblöcke, Captions sauber aus dem
+Body heraushalten. Direkter Impact auf Keywords, FTS und Embeddings.
+
+**P4 — Export & Suche**
 - `atlas search --semantic` — Fusion-Ranking FTS5 + LanceDB
-- Referenz-Parser: Referenzblöcke → strukturierte `cites`-Tripel
+- Referenz-Parser: Referenzblöcke → `cites`-Tripel
 - BibTeX, JSON, CSV Export (`atlas export`)
 - `atlas global status` und `atlas global search`
-- GND-Anreicherung vertiefen: `broaderTermInstantial` für Topic-Hierarchie
-- Keyword-Qualität: MultipartiteRank (pke) als Alternative zu YAKE
-- Thesaurus-Boost: GND-Kandidaten in YAKE-Kandidaten höher gewichten
-- RVK-Qualität: Topic als primäre Suchanfrage statt YAKE-Keywords
-- Section precision verbessern: Formelblöcke (`Given:`, `Solution:`, `Answer:`)
-  werden fälschlich als Headings erkannt (Timber Manual: +228 extras)
-- Title accuracy verbessern: viele Dokumente ohne erkannten Titel (`actual=''`)
-- Laudel Dissertation: 0/8 Sections gefunden (Zonierungsproblem)
-- `runner.py`: Pass-0 DocumentProfile vollständig integrieren
+
+**P5 — Erschließungsqualität**
+- MultipartiteRank (pke) als Alternative zu YAKE
+- RVK-Qualität: Topic als primäre Suchanfrage
+- GND: `broaderTermInstantial` für Topic-Hierarchie
 
 ---
 
 ### Phase 4 — Reife & Produktivität
 
-**Ziel:** Tägliche Nutzung ohne Reibungsverluste, strukturelle
-Lücken aus Phase 1 und 2 schließen.
+**Ziel:** Tägliche Nutzung ohne Reibungsverluste.
 
 **Enthält:**
-- Spaltenerkennung (`column_hint`) — schließt Edinburgh-Limit
-  bei letter-spaced Headings in Mehrspaltenlayouts
 - Mehrsprachige Embeddings: `paraphrase-multilingual-MiniLM-L12-v2`
-  als Alternative zu `all-MiniLM-L6-v2` für DE/FR/NL-Dokumente
-- Autoren-Extraktion aus Fließtext verbessern
-- Inkrementelles Update (nur geänderte Dokumente neu verarbeiten)
+- Autoren-Extraktion verbessern
+- Inkrementelles Update
 - Performance-Optimierung: LanceDB ANN-Index für >1000 Dokumente
 - Verbesserte OCR-Pipeline für Archivdokumente
+- i18n: Section-Labels in `core/i18n/`
 - `atlas dev` auslagern oder entfernen
-- i18n: Section-Labels in `core/i18n/` statt hartkodierten Sets
-- Altes `src/atlas/document_understanding/` Verzeichnis entfernen
+- Altes `src/atlas/document_understanding/` entfernen
 
 ---
 
@@ -120,12 +126,8 @@ Lücken aus Phase 1 und 2 schließen.
 ### OE-1: Spaltenerkennung
 
 `column_hint` ist im Schema vorhanden aber nie befüllt.
-Echte Spaltenerkennung würde `body_like`-Scores verbessern
-und das Edinburgh-Limit bei letter-spaced Headings lösen.
-
-**Optionen:**
-- A) Clustering der x0-Positionen pro Seite (einfach, robust)
-- B) Layout-Graph-Ansatz wie im alten `layout_clusters.py` (mächtiger, komplexer)
+Im neuen Ansatz teilweise durch `TypographyProfile` adressiert
+(body_font nach Zeichenanzahl ist spaltenunabhängig).
 
 **Status:** Zurückgestellt auf Phase 4.
 
@@ -133,9 +135,7 @@ und das Edinburgh-Limit bei letter-spaced Headings lösen.
 
 ### OE-2: Autoren-Extraktion
 
-`author_like` berechnet nur schwache heuristische Scores.
-Autoren-Extraktion aus Fließtext funktioniert für einfache Fälle,
-aber Institutionen und mehrteilige Namen werden oft falsch erkannt.
+`author_like` erkennt Institutionen und mehrteilige Namen nicht zuverlässig.
 
 **Status:** Grundfunktion in Phase 1. Verbesserung in Phase 4.
 
@@ -144,35 +144,28 @@ aber Institutionen und mehrteilige Namen werden oft falsch erkannt.
 ### OE-3: Dokumenttyp-Klassifikation ✓
 
 Regelbasiert über `early_meta`-Signale implementiert.
-Testkorpus: 100% Genauigkeit auf 5 Dokumenten, 85% auf 21 Dokumenten.
+100% auf 5 Dokumenten, 85% auf 21 Dokumenten.
 
 ---
 
 ### OE-4: Konfliktauflösung bei mehreren Katalogen
 
-`atlas global search` fragt mehrere Kataloge sequenziell ab.
-Duplikate (gleicher SHA-256) sollten erkannt und zusammengeführt werden.
-
-**Status:** Offen. Relevant ab Phase 3.
+**Status:** Offen. Relevant ab Phase 3 (`atlas global search`).
 
 ---
 
 ### OE-5: Persistenz der DU-Zwischenergebnisse
 
-Alle DU-Layer werden vollständig in SQLite persistiert.
-Schätzung: ~50–100 KB pro Dokument für alle Layer.
+Im neuen Ansatz kommen `TypographyProfile`-Felder in `du_documents`
+und `du_heading_patterns` als neue Tabelle hinzu.
 
-**Status:** Option A (alle Layer persistent) in Phase 1+2.
-Bewertung in Phase 4 nach Performance-Messungen.
+**Status:** Schema-Entscheidung in Phase 3.
 
 ---
 
 ### OE-6: i18n-Architektur
 
-Section-Labels (Abstract, References, Appendix, …) sind
-hartcodiert in `text_patterns.py` und `section_labels.py`.
-Für mehrsprachige Korpora (DE/EN/FR) sollte ein `core/i18n/`
-Modul mit YAML-basierten Übersetzungen gebaut werden.
+Section-Labels hartcodiert in `text_patterns.py` und `section_labels.py`.
 
 **Status:** Zurückgestellt auf Phase 4.
 
@@ -180,82 +173,72 @@ Modul mit YAML-basierten Übersetzungen gebaut werden.
 
 ### OE-7: Wikidata als Verbindungsknoten ✓
 
-`enrich/wikidata.py` implementiert. Verbindet Atlas-interne URIs
-mit Wikidata QIDs via `owl:sameAs`. Produktiver Einsatz sobald
-Netzwerkzugang verfügbar.
+`enrich/wikidata.py` implementiert.
 
 ---
 
 ### OE-8: Mehrsprachige Embeddings
 
-`all-MiniLM-L6-v2` ist englisch-dominant. Deutsche Dokumente
-erzielen Ähnlichkeits-Scores von 0.27–0.30 gegenüber englischen.
-
-**Optionen:**
-- A) `paraphrase-multilingual-MiniLM-L12-v2` — gleiche Dimension (384),
-  direkt austauschbar, gute EN/DE/FR-Performance
-- B) Sprach-spezifische Modelle pro Dokument — komplex
-- C) Übersetzungs-Pipeline vor Embedding — aufwendig, verlustbehaftet
-
-**Status:** Option A empfohlen für Phase 4. Erfordert `atlas dev du embed-all`.
+`all-MiniLM-L6-v2` englisch-dominant. DE-Dokumente: 0.27–0.30.
+Option A: `paraphrase-multilingual-MiniLM-L12-v2` empfohlen für Phase 4.
 
 ---
 
 ### OE-9: Keyword-Qualität für Sacherschließung
 
-YAKE auf Dokument-Ebene produziert für RVK/GND-Klassifikation
-zu unspezifische Terme. Die Kette Keywords → GND → RVK ist nur
-so gut wie der erste Schritt.
+YAKE produziert zu unspezifische Terme für RVK/GND-Klassifikation.
+MultipartiteRank (pke) als Alternative in Phase 3 (P5).
 
-**Ansätze:**
-- A) MultipartiteRank (pke) — graph-basiert, positionsbewusst,
-  für wissenschaftliche Dokumente entwickelt
-- B) Thesaurus-Boost — GND-Kandidaten in YAKE doppelt gewichten
-- C) Sliding Window innerhalb von Kapiteln — Kapitelgrenzen
-  respektieren, innerhalb langer Kapitel Fenstergranularität
+---
 
-**Status:** YAKE in Phase 2. Verbesserung in Phase 3.
+### OE-10: DU-Opportunismus (neu)
+
+Das neue DU-System folgt dem Prinzip: strukturierte Erkennung nur
+wenn hochkonfident, nie raten.
+
+Konkrete Konsequenzen:
+- Kein erkennbares Heading-Pattern → leerer Section Tree
+- Schwache Struktur → nur L1 wenn konfident
+- Tiefe Hierarchie (L4+) → nur bei nummerierter Gliederung oder TOC
+
+**Status:** Leitprinzip für Phase 3.
 
 ---
 
 ## Bekannte Einschränkungen
 
 **Nicht unterstützt:**
-- Passwortgeschützte PDFs (werden mit Fehler abgelehnt)
-- PDFs mit ausschließlich Vektorgrafiken ohne Text
-- Rechts-nach-Links-Sprachen (Arabisch, Hebräisch)
-- Sehr große PDFs (>500 Seiten) — DU-Pipeline läuft, aber langsam
+- Passwortgeschützte PDFs
+- PDFs ohne Text-Layer
+- Rechts-nach-Links-Sprachen
+- Sehr große PDFs (>500 Seiten) — langsam
+- Dokumente mit inkonsistenter Heading-Formatierung
 
-**Bekannte Schwächen der DU-Pipeline:**
-- Mehrspaltige Layouts: `body_like`-Scores ohne `column_hint` weniger präzise
-- Letter-spaced Headings: erster Buchstabe geht bei Normalisierung verloren
-- Tabelleninhalte: als Blöcke segmentiert, nicht als strukturierte Tabellen
-- Mathematische Formeln und Formelblöcke: als Headings fehlklassifiziert
-  (`Given:`, `Solution:`, `Answer:` — betrifft Timber Construction Manual)
-- Captions: werden gelegentlich als `body` klassifiziert
-- Titel: bei vielen Dokumenten kein Titelblock erkannt (`actual=''`)
-- Laudel Dissertation: 0/8 Sections durch Zonierungsproblem
+**Bekannte Schwächen der DU-Pipeline (Phase 2):**
+- Titel-Extraktion 25% — wichtigstes offenes Problem
+- Section Precision 13% — Formelblöcke, TOC-Duplikate als Headings
+- Laudel Dissertation: 0/8 Sections (Zonierungsproblem)
+- Absolute Schwellenwerte → wird durch TypographyProfile adressiert
 
 **Bekannte Schwächen der Erschließung:**
-- Mehrsprachige Ähnlichkeitssuche: englisch-dominant (OE-8)
-- RVK-Klassifikation: Treffsicherheit abhängig von Keyword-Qualität
-- Topic-Extraktion: Monografien ohne Preface-Block landen im Kapitelinhalt
-- GND-Suche: ohne Typ-Filter werden Personen und Körperschaften gefunden
+- Mehrsprachige Ähnlichkeitssuche englisch-dominant (OE-8)
+- RVK-Treffsicherheit abhängig von Keyword-Qualität
+- GND: Personen und Körperschaften ohne Typ-Filter
 
 ---
 
 ## Qualitätsziele
 
-| Metrik | Phase 1 | Phase 2 | Ziel Phase 4 |
+| Metrik | Phase 2 | Ziel Phase 3 | Ziel Phase 4 |
 |---|---|---|---|
-| Dokumenttyp-Genauigkeit | 100% | 85% | 95% |
-| Titel-Extraktion | 100% | 25% | 90% |
-| Autoren-Extraktion | 57% | 32% | 85% |
-| Section-Tree Precision | — | 13% | 0.70 |
-| Section-Tree Recall | — | 77% | 0.85 |
-| Section-Tree F1 | 54% | 23% | 0.75 |
-| Semantische Ähnlichkeit EN→EN | — | 0.595 | 0.70 |
-| Semantische Ähnlichkeit DE→EN | — | 0.30 | 0.55 (multilingual) |
-| Topic-Qualität (korrekt) | — | 60% | 85% |
-| RVK-Treffsicherheit | — | ~20% | 70% |
-| Verarbeitungszeit pro Dokument | <10s | <15s | <10s |
+| Dokumenttyp-Genauigkeit | 85% | 90% | 95% |
+| Titel-Extraktion | 25% | 80% | 90% |
+| Autoren-Extraktion | 32% | 50% | 80% |
+| Section-Tree Precision | 13% | 60% | 75% |
+| Section-Tree Recall | 77% | 75% | 85% |
+| Section-Tree F1 | 23% | 67% | 80% |
+| Semantische Ähnlichkeit EN→EN | 0.595 | 0.65 | 0.70 |
+| Semantische Ähnlichkeit DE→EN | 0.30 | 0.35 | 0.55 |
+| Topic-Qualität | 60% | 70% | 85% |
+| RVK-Treffsicherheit | ~20% | 40% | 70% |
+| Verarbeitungszeit/Dokument | <15s | <12s | <10s |
