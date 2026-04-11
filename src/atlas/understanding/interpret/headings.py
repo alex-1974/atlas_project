@@ -80,8 +80,14 @@ def _fetch_blocks(conn: sqlite3.Connection, document_id: str) -> list[dict]:
                r.role, r.title_score, r.heading_score, r.body_score,
                r.caption_score, r.noise_score, r.reference_score,
                sf.word_count, sf.is_short_line,
-               COALESCE(g.narrow_width_like, 0) AS narrow_width_like,
-               COALESCE(g.near_image_score,  0) AS near_image_score,
+               COALESCE(g.narrow_width_like, 0)  AS narrow_width_like,
+               COALESCE(g.near_image_score,  0)  AS near_image_score,
+               COALESCE(g.in_colored_box,    0)  AS in_colored_box,
+               COALESCE(g.whitespace_before, 0)  AS whitespace_before,
+               COALESCE(f.running_header_like,   0) AS running_header_like,
+               COALESCE(f.repeated_across_pages, 0) AS repeated_across_pages,
+               COALESCE(sf.starts_with_number,   0) AS starts_with_number,
+               COALESCE(sp.in_flow_score,        0.5) AS in_flow_score,
                sm.is_references_marker, sm.is_appendix_marker,
                sm.is_figure_marker, sm.is_table_marker,
                sm.contains_doi,
@@ -94,6 +100,8 @@ def _fetch_blocks(conn: sqlite3.Connection, document_id: str) -> list[dict]:
         LEFT JOIN du_block_geometry      g  ON g.block_id  = b.block_id
         LEFT JOIN du_block_semantic_micro sm ON sm.block_id = b.block_id
         LEFT JOIN du_block_zones         z  ON z.block_id  = b.block_id
+        LEFT JOIN du_block_furniture     f  ON f.block_id  = b.block_id
+        LEFT JOIN du_block_spacing       sp ON sp.block_id = b.block_id
         WHERE b.document_id = ?
         ORDER BY b.page_index, b.block_index
         """,
@@ -326,16 +334,57 @@ def _normalize_headings(headings: list[dict]) -> list[dict]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def compute_headings(conn: sqlite3.Connection, document_id: str,
-                     ocr_mode: bool = False) -> None:
+
+def _should_keep_pattern(
+    block: dict,
+    patterns: list,
+    body_font: float,
+    gap_norm: float,
+) -> tuple:
+    """Pattern-based heading gate. Returns (keep, source_tag)."""
+    # Hard exclusions
+    if bool(block.get("running_header_like")) or bool(block.get("repeated_across_pages")):
+        return False, ""
+    if bool(block.get("in_colored_box")):
+        return False, ""
+    in_flow = _f(block.get("in_flow_score") or 0.5)
+    if in_flow > 0.90:
+        return False, ""
+    italic   = bool(block.get("italic"))
+    starts_n = bool(block.get("starts_with_number"))
+    fs       = _f(block.get("font_size"))
+    font_ratio = fs / body_font if body_font > 0 else 1.0
+    if italic and starts_n and font_ratio <= 1.05:
+        return False, ""  # caption
+    # Pattern matching
+    bold     = bool(block.get("bold"))
+    all_caps = bool(block.get("is_all_caps"))
+    ws       = _f(block.get("whitespace_before"))
+    gap_rel  = ws / gap_norm if gap_norm > 0 else 1.0
+    text     = normalize(block.get("text") or "")
+    for p in patterns:
+        if p.matches(font_ratio, bold, all_caps, gap_rel, in_flow, text):
+            return True, f"pattern.v1:L{p.level}"
+    return False, ""
+
+
+def compute_headings(
+    conn: sqlite3.Connection,
+    document_id: str,
+    ocr_mode: bool = False,
+    patterns=None,
+    typography_profile=None,
+) -> None:
     """Collect, adjust, filter, and persist heading candidates.
 
     Args:
-        ocr_mode: If True, apply stricter thresholds suitable for
-                  OCR-scanned documents where geometry is unreliable.
-
+        ocr_mode: If True, stricter thresholds for OCR documents.
+        patterns: Optional list[HeadingPattern] from anchor_detection.
+                  If provided, pattern-based selection is used.
+        typography_profile: Optional TypographyProfile for body_font/gap_norm.
     Writes du_heading_candidates. Idempotent — DELETE + INSERT.
     """
+
     blocks = _fetch_blocks(conn, document_id)
     if not blocks:
         return
@@ -345,16 +394,33 @@ def compute_headings(conn: sqlite3.Connection, document_id: str,
     )
     body_font = (body_font_sizes[len(body_font_sizes) // 2]
                  if body_font_sizes else 10.0)
+    if typography_profile is not None:
+        body_font = getattr(typography_profile, "body_font", body_font)
+    gap_norm = 5.0
+    if typography_profile is not None:
+        gap_norm = getattr(typography_profile, "gap_norm", gap_norm)
+
+    use_patterns = patterns is not None and len(patterns) > 0
 
     candidates: list[dict] = []
 
     for block in blocks:
         raw_zone  = block.get("zone") or Zone.BODY
         zone      = _OLD_TO_NEW.get(raw_zone, Zone.BODY)
-        adj_score = _adjust_heading_score(block, zone, ocr_mode=ocr_mode)
 
-        if not _should_keep(block, zone, adj_score, ocr_mode=ocr_mode):
-            continue
+        if use_patterns:
+            keep, src_tag = _should_keep_pattern(
+                block, patterns, body_font, gap_norm
+            )
+            if not keep:
+                continue
+            adj_score = _adjust_heading_score(block, zone, ocr_mode=ocr_mode)
+            source = src_tag
+        else:
+            adj_score = _adjust_heading_score(block, zone, ocr_mode=ocr_mode)
+            if not _should_keep(block, zone, adj_score, ocr_mode=ocr_mode):
+                continue
+            source = ('headings.ocr:' if ocr_mode else 'headings.v1:') + zone
 
         candidates.append({
             "block_id":          block["block_id"],
@@ -369,7 +435,7 @@ def compute_headings(conn: sqlite3.Connection, document_id: str,
             "italic":            block.get("italic"),
             "heading_score":     adj_score,
             "body_score":        _f(block.get("body_score")),
-            "source":            f"headings.{'ocr' if ocr_mode else 'v1'}:{zone}",
+            "source":            source,
             "was_letter_spaced": bool(block.get("is_letter_spaced")),
         })
 

@@ -158,9 +158,17 @@ def _detect_title(headings: list[dict],
     if not headings:
         return None
     if title_block_ids:
+        # Title block is already classified in du_block_roles — look for it
+        # in heading candidates. If not found (title blocks are intentionally
+        # excluded from heading candidates), return None rather than falling
+        # back to font-size heuristic which incorrectly marks section headings
+        # as the document title.
         titled = [h for h in headings if str(h.get("block_id")) in title_block_ids]
         if titled:
             return sorted(titled, key=lambda h: _i(h.get("block_index")))[0]
+        return None
+    # No title classification available — use largest font as heuristic.
+    # Only applies when du_block_roles has no title block at all.
     max_fs = max(_f(h.get("font_size")) for h in headings)
     cands  = sorted(
         [h for h in headings if _f(h.get("font_size")) == max_fs],

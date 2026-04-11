@@ -70,6 +70,9 @@ from atlas.understanding.interpret.roles import compute_roles
 from atlas.understanding.interpret.consensus import compute_consensus
 from atlas.understanding.interpret.zones import compute_zones
 from atlas.understanding.interpret.headings import compute_headings
+from atlas.understanding.interpret.frontmatter import interpret_frontmatter
+from atlas.understanding.measure.typography_profile import build_typography_profile
+from atlas.understanding.interpret.anchor_detection import detect_anchors
 from atlas.understanding.interpret.section_tree import compute_section_tree
 from atlas.understanding.interpret.document_type import compute_document_type
 
@@ -129,12 +132,37 @@ def run_du_pipeline(
     compute_context(conn, document_id)
     compute_semantic_micro(conn, document_id)
 
+    # Layer 1.5 — TypographyProfile (document-relative norms)
+    tp = build_typography_profile(conn, document_id)
+
     # Layer 2 — profile forwarded for quadrant-specific weights
     compute_signals(conn, document_id, profile=profile)
-
     # image_pdf: no reliable text layer → skip Layer 3 entirely
     if is_image:
         return True
+    # Layer 2.5 — neighbourhood graph score corrections
+    run_graph_corrections(conn, document_id)
+    # Layer 3 — Pass 1: roles without document type adjustment
+    compute_roles(conn, document_id)
+    compute_consensus(conn, document_id)
+    compute_zones(conn, document_id)
+    # Anchor Detection — after zones, before headings
+    heading_patterns = detect_anchors(conn, document_id, tp)
+    compute_headings(conn, document_id, ocr_mode=is_ocr,
+                     patterns=heading_patterns, typography_profile=tp)
+    compute_section_tree(conn, document_id, ocr_mode=is_ocr)
+    # Document type detection — uses roles + section tree from Pass 1
+    compute_document_type(conn, document_id)
+    # Layer 3 — Pass 2: recompute roles with document type adjustments
+    compute_roles(conn, document_id)
+    compute_consensus(conn, document_id)
+    compute_zones(conn, document_id)
+    compute_headings(conn, document_id, ocr_mode=is_ocr,
+                     patterns=heading_patterns, typography_profile=tp)
+    compute_section_tree(conn, document_id, ocr_mode=is_ocr)
+    # Pass 3.0 — Frontmatter: title/author nach finalem roles-Pass
+    interpret_frontmatter(conn, document_id)
+    return True
 
     # Layer 2.5 — neighbourhood graph score corrections
     run_graph_corrections(conn, document_id)
