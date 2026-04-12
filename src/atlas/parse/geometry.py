@@ -1,0 +1,1866 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from statistics import median
+import math
+
+import fitz  # PyMuPDF
+
+
+# -----------------------------------------------------------------------------
+# Primitive layout objects
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class PageBlock:
+    """
+    Parsernahe Layout-Einheit auf Basis von PyMuPDF-Blocks.
+
+    Koordinaten im MuPDF-Seitenraum:
+    - Ursprung oben links
+    - x wächst nach rechts
+    - y wächst nach unten
+    """
+
+    page_index: int
+    block_index: int
+    block_type: int  # 0=text, 1=image
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    text: str
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y1 - self.y0)
+
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+    @property
+    def x_center(self) -> float:
+        return self.x0 + self.width / 2.0
+
+    @property
+    def y_center(self) -> float:
+        return self.y0 + self.height / 2.0
+
+    @property
+    def text_length(self) -> int:
+        return len(self.text.strip())
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ColumnBox:
+    """
+    Seitenlokale, spaltenkompatible Box auf Basis einzelner Textzeilen.
+    """
+
+    page_index: int
+    parity: str  # "odd" | "even"
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y1 - self.y0)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# -----------------------------------------------------------------------------
+# Geometry model
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class FurnitureBand:
+    side: str  # "top" | "bottom"
+    y0: float
+    y1: float
+    coverage_ratio: float
+    pages_present: int
+    page_parity: str = "all"  # "all" | "odd" | "even"
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y1 - self.y0)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class MarginZone:
+    side: str  # "left" | "right"
+    x0: float
+    x1: float
+    coverage_ratio: float
+    pages_present: int
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class BodyRegion:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y1 - self.y0)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ColumnLane:
+    """
+    Dokumentweit dominante vertikale Textbahn.
+    """
+
+    index: int
+    x0: float
+    x1: float
+    pages_present: int
+    coverage_ratio: float
+    block_count: int
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class RobustStats:
+    median: float
+    mad: float
+    robust_sigma: float
+    standard_error: float
+    ci95_low: float
+    ci95_high: float
+    sample_size: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PageColumnHypothesis:
+    """
+    Seitenweise Hypothese über die Zahl und Lage von Spalten.
+    """
+
+    page_index: int
+    column_count: int
+    lane_ranges_rel: list[tuple[float, float]]
+    score: float
+    candidate_line_count: int = 0
+    wide_line_count: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PageLayoutSignature:
+    page_index: int
+    page_number: int
+    parity: str
+
+    has_header: bool
+    has_footer: bool
+
+    body_x0: float | None
+    body_x1: float | None
+    body_y0: float | None
+    body_y1: float | None
+
+    page_column_count: int
+    active_lane_indices: list[int]
+    active_lane_ranges: list[tuple[float, float]]
+
+    text_block_count: int
+    column_box_count: int
+    body_block_count: int
+
+    def layout_key(self, x_step: float = 24.0, y_step: float = 36.0) -> str:
+        def q(value: float | None, step: float) -> str:
+            if value is None:
+                return "na"
+            return str(int(round(value / step) * step))
+
+        body_present = int(
+            self.body_x0 is not None
+            and self.body_x1 is not None
+            and self.body_y0 is not None
+            and self.body_y1 is not None
+        )
+
+        width = (
+            (self.body_x1 - self.body_x0)
+            if self.body_x0 is not None and self.body_x1 is not None
+            else None
+        )
+        height = (
+            (self.body_y1 - self.body_y0)
+            if self.body_y0 is not None and self.body_y1 is not None
+            else None
+        )
+
+        return (
+            f"body:{body_present}"
+            f"|cols:{self.page_column_count}"
+            f"|hdr:{int(self.has_header)}"
+            f"|ftr:{int(self.has_footer)}"
+            f"|bx0:{q(self.body_x0, x_step)}"
+            f"|by0:{q(self.body_y0, y_step)}"
+            f"|bw:{q(width, x_step)}"
+            f"|bh:{q(height, y_step)}"
+        )
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["layout_key"] = self.layout_key()
+        return data
+
+
+@dataclass(slots=True)
+class LayoutPattern:
+    key: str
+    pages_present: int
+    total_pages: int
+    coverage_ratio: float
+    page_indexes: list[int]
+    page_runs: list[tuple[int, int]]
+
+    body_x0_stats: RobustStats | None = None
+    body_x1_stats: RobustStats | None = None
+    body_y0_stats: RobustStats | None = None
+    body_y1_stats: RobustStats | None = None
+
+    column_count_median: float | None = None
+    column_count_mad: float | None = None
+
+    stability_score: float | None = None
+    confidence_score: float | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class GeometryProfile:
+    page_count: int
+    paper_width: float
+    paper_height: float
+
+    text_left: float
+    text_right: float
+    text_top: float
+    text_bottom: float
+
+    header_bottom: float
+    footer_top: float
+
+    margin_left: float
+    margin_right: float
+
+    column_count: int
+    column_widths: list[float]
+    column_gap: float | None
+    column_lanes: list[ColumnLane] = field(default_factory=list)
+
+    header_band: FurnitureBand | None = None
+    footer_band: FurnitureBand | None = None
+    header_band_odd: FurnitureBand | None = None
+    header_band_even: FurnitureBand | None = None
+    footer_band_odd: FurnitureBand | None = None
+    footer_band_even: FurnitureBand | None = None
+
+    left_margin_zone: MarginZone | None = None
+    right_margin_zone: MarginZone | None = None
+
+    body_region: BodyRegion | None = None
+    page_body_regions: list[BodyRegion | None] = field(default_factory=list)
+
+    page_layout_signatures: list[PageLayoutSignature] = field(default_factory=list)
+    layout_patterns: list[LayoutPattern] = field(default_factory=list)
+
+    diagnostics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    values = sorted(values)
+    pos = (len(values) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    frac = pos - lo
+    return values[lo] * (1.0 - frac) + values[hi] * frac
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(median(values))
+
+
+def _mad(values: list[float], med: float | None = None) -> float:
+    if not values:
+        return 0.0
+    m = med if med is not None else _median(values)
+    return _median([abs(v - m) for v in values])
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _group_by_page(blocks: list[PageBlock]) -> dict[int, list[PageBlock]]:
+    pages: dict[int, list[PageBlock]] = {}
+    for block in blocks:
+        pages.setdefault(block.page_index, []).append(block)
+    return pages
+
+
+def _is_text_like(block: PageBlock) -> bool:
+    return block.block_type == 0 and bool(block.text.strip())
+
+
+def _is_odd_page(page_index: int) -> bool:
+    return (page_index + 1) % 2 == 1
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _page_runs(page_indexes: list[int]) -> list[tuple[int, int]]:
+    if not page_indexes:
+        return []
+
+    pages = sorted(page_indexes)
+    runs: list[tuple[int, int]] = []
+    start = pages[0]
+    prev = pages[0]
+
+    for p in pages[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        runs.append((start + 1, prev + 1))
+        start = p
+        prev = p
+
+    runs.append((start + 1, prev + 1))
+    return runs
+
+
+def _robust_stats(values: list[float]) -> RobustStats | None:
+    if not values:
+        return None
+
+    med = _median(values)
+    mad = _mad(values, med)
+    robust_sigma = 1.4826 * mad
+    n = len(values)
+    se = robust_sigma / math.sqrt(n) if n > 0 else 0.0
+    ci_half = 1.96 * se
+
+    return RobustStats(
+        median=med,
+        mad=mad,
+        robust_sigma=robust_sigma,
+        standard_error=se,
+        ci95_low=med - ci_half,
+        ci95_high=med + ci_half,
+        sample_size=n,
+    )
+
+
+def _smooth(values: list[float], window: int = 5) -> list[float]:
+    if not values or window <= 1:
+        return values[:]
+    radius = window // 2
+    smoothed: list[float] = []
+    for i in range(len(values)):
+        lo = max(0, i - radius)
+        hi = min(len(values), i + radius + 1)
+        smoothed.append(_mean(values[lo:hi]))
+    return smoothed
+
+
+# -----------------------------------------------------------------------------
+# Public extraction API
+# -----------------------------------------------------------------------------
+
+
+def extract_page_blocks(pdf_path: Path) -> tuple[list[PageBlock], int, float, float]:
+    """
+    Extrahiert PyMuPDF-Blöcke als reine Python-Primitive.
+    Diese Funktion muss öffentlich bleiben, weil pipeline.py sie importiert.
+    """
+    blocks: list[PageBlock] = []
+
+    with fitz.open(pdf_path) as doc:
+        if len(doc) == 0:
+            raise ValueError(f"Empty PDF: {pdf_path}")
+
+        first_page = doc.load_page(0)
+        paper_width = float(first_page.rect.width)
+        paper_height = float(first_page.rect.height)
+        page_count = len(doc)
+
+        for page_index in range(page_count):
+            page = doc.load_page(page_index)
+            raw_blocks = page.get_text("blocks")
+
+            for block_index, raw in enumerate(raw_blocks):
+                x0, y0, x1, y1, text, _block_no, block_type = raw[:7]
+
+                blocks.append(
+                    PageBlock(
+                        page_index=int(page_index),
+                        block_index=int(block_index),
+                        block_type=int(block_type),
+                        x0=float(x0),
+                        y0=float(y0),
+                        x1=float(x1),
+                        y1=float(y1),
+                        text=str(text or ""),
+                    )
+                )
+
+    return blocks, page_count, paper_width, paper_height
+
+
+# -----------------------------------------------------------------------------
+# Furniture detection
+# -----------------------------------------------------------------------------
+
+
+def _top_edge_blocks(page_blocks: list[PageBlock], page_height: float) -> list[PageBlock]:
+    top_limit = page_height * 0.16
+    max_height = page_height * 0.06
+    return [
+        b
+        for b in page_blocks
+        if _is_text_like(b)
+        and b.y0 <= top_limit
+        and b.height <= max_height
+    ]
+
+
+def _bottom_edge_blocks(page_blocks: list[PageBlock], page_height: float) -> list[PageBlock]:
+    bottom_limit = page_height * 0.84
+    max_height = page_height * 0.06
+    return [
+        b
+        for b in page_blocks
+        if _is_text_like(b)
+        and b.y1 >= bottom_limit
+        and b.height <= max_height
+    ]
+
+
+def _build_page_band_candidate(
+    page_blocks: list[PageBlock],
+    page_height: float,
+    side: str,
+) -> tuple[float, float] | None:
+    candidates = (
+        _top_edge_blocks(page_blocks, page_height)
+        if side == "top"
+        else _bottom_edge_blocks(page_blocks, page_height)
+    )
+    if not candidates:
+        return None
+
+    y0 = min(b.y0 for b in candidates)
+    y1 = max(b.y1 for b in candidates)
+
+    max_band_height = page_height * 0.075
+    if (y1 - y0) > max_band_height:
+        return None
+
+    return (y0, y1)
+
+
+def _page_band_candidates(
+    page_map: dict[int, list[PageBlock]],
+    page_height: float,
+    side: str,
+) -> dict[int, tuple[float, float]]:
+    result: dict[int, tuple[float, float]] = {}
+    for page_index, page_blocks in page_map.items():
+        band = _build_page_band_candidate(page_blocks, page_height, side)
+        if band is not None:
+            result[page_index] = band
+    return result
+
+
+def _aggregate_band_candidates(
+    candidates: dict[int, tuple[float, float]],
+    page_indexes: list[int],
+    side: str,
+    page_parity: str,
+    page_height: float,
+) -> FurnitureBand | None:
+    if page_parity == "odd":
+        eligible_pages = [p for p in page_indexes if _is_odd_page(p)]
+    elif page_parity == "even":
+        eligible_pages = [p for p in page_indexes if not _is_odd_page(p)]
+    else:
+        eligible_pages = list(page_indexes)
+
+    if not eligible_pages:
+        return None
+
+    present = [(p, candidates[p]) for p in eligible_pages if p in candidates]
+    if not present:
+        return None
+
+    coverage_ratio = len(present) / len(eligible_pages)
+    if coverage_ratio < 0.45:
+        return None
+
+    y0_values = [band[0] for _, band in present]
+    y1_values = [band[1] for _, band in present]
+
+    med_y0 = _median(y0_values)
+    med_y1 = _median(y1_values)
+
+    tol = page_height * 0.018
+    filtered = [
+        (p, band)
+        for p, band in present
+        if abs(band[0] - med_y0) <= tol and abs(band[1] - med_y1) <= tol
+    ]
+
+    if not filtered:
+        return None
+
+    filtered_coverage = len(filtered) / len(eligible_pages)
+    if filtered_coverage < 0.40:
+        return None
+
+    fy0 = _percentile([band[0] for _, band in filtered], 0.20)
+    fy1 = _percentile([band[1] for _, band in filtered], 0.80)
+
+    if fy1 <= fy0:
+        return None
+
+    max_band_height = page_height * 0.08
+    if (fy1 - fy0) > max_band_height:
+        return None
+
+    return FurnitureBand(
+        side=side,
+        y0=fy0,
+        y1=fy1,
+        coverage_ratio=filtered_coverage,
+        pages_present=len(filtered),
+        page_parity=page_parity,
+    )
+
+
+def _merge_top_bands(bands: list[FurnitureBand | None]) -> FurnitureBand | None:
+    valid = [b for b in bands if b is not None]
+    if not valid:
+        return None
+    return FurnitureBand(
+        side="top",
+        y0=min(b.y0 for b in valid),
+        y1=max(b.y1 for b in valid),
+        coverage_ratio=max(b.coverage_ratio for b in valid),
+        pages_present=max(b.pages_present for b in valid),
+        page_parity="all",
+    )
+
+
+def _merge_bottom_bands(bands: list[FurnitureBand | None]) -> FurnitureBand | None:
+    valid = [b for b in bands if b is not None]
+    if not valid:
+        return None
+    return FurnitureBand(
+        side="bottom",
+        y0=min(b.y0 for b in valid),
+        y1=max(b.y1 for b in valid),
+        coverage_ratio=max(b.coverage_ratio for b in valid),
+        pages_present=max(b.pages_present for b in valid),
+        page_parity="all",
+    )
+
+
+def detect_repeated_furniture_bands(
+    blocks: list[PageBlock],
+    page_count: int,
+    page_height: float,
+) -> tuple[
+    FurnitureBand | None,
+    FurnitureBand | None,
+    FurnitureBand | None,
+    FurnitureBand | None,
+    FurnitureBand | None,
+    FurnitureBand | None,
+    dict[str, object],
+]:
+    text_blocks = [b for b in blocks if _is_text_like(b)]
+    page_map = _group_by_page(text_blocks)
+    page_indexes = list(range(page_count))
+
+    top_candidates = _page_band_candidates(page_map, page_height, "top")
+    bottom_candidates = _page_band_candidates(page_map, page_height, "bottom")
+
+    header_odd = _aggregate_band_candidates(
+        top_candidates, page_indexes, "top", "odd", page_height
+    )
+    header_even = _aggregate_band_candidates(
+        top_candidates, page_indexes, "top", "even", page_height
+    )
+    footer_odd = _aggregate_band_candidates(
+        bottom_candidates, page_indexes, "bottom", "odd", page_height
+    )
+    footer_even = _aggregate_band_candidates(
+        bottom_candidates, page_indexes, "bottom", "even", page_height
+    )
+
+    header_band = _merge_top_bands([header_odd, header_even])
+    footer_band = _merge_bottom_bands([footer_odd, footer_even])
+
+    diagnostics = {
+        "top_page_candidates_count": len(top_candidates),
+        "bottom_page_candidates_count": len(bottom_candidates),
+        "header_odd": header_odd.to_dict() if header_odd else None,
+        "header_even": header_even.to_dict() if header_even else None,
+        "footer_odd": footer_odd.to_dict() if footer_odd else None,
+        "footer_even": footer_even.to_dict() if footer_even else None,
+    }
+
+    return (
+        header_band,
+        footer_band,
+        header_odd,
+        header_even,
+        footer_odd,
+        footer_even,
+        diagnostics,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Body regions
+# -----------------------------------------------------------------------------
+
+
+def _filter_out_furniture(
+    blocks: list[PageBlock],
+    header_band: FurnitureBand | None,
+    footer_band: FurnitureBand | None,
+) -> list[PageBlock]:
+    result: list[PageBlock] = []
+
+    for block in blocks:
+        if not _is_text_like(block):
+            continue
+        if header_band and block.y1 <= header_band.y1 + 2.0:
+            continue
+        if footer_band and block.y0 >= footer_band.y0 - 2.0:
+            continue
+        result.append(block)
+
+    return result
+
+
+def detect_page_body_region(
+    page_blocks: list[PageBlock],
+    page_width: float,
+    page_height: float,
+) -> BodyRegion | None:
+    text_blocks = [b for b in page_blocks if _is_text_like(b)]
+    if not text_blocks:
+        return None
+
+    x0s = [b.x0 for b in text_blocks]
+    x1s = [b.x1 for b in text_blocks]
+    y0s = [b.y0 for b in text_blocks]
+    y1s = [b.y1 for b in text_blocks]
+
+    x0 = _clamp(_percentile(x0s, 0.15), 0.0, page_width)
+    x1 = _clamp(_percentile(x1s, 0.85), 0.0, page_width)
+    y0 = _clamp(_percentile(y0s, 0.15), 0.0, page_height)
+    y1 = _clamp(_percentile(y1s, 0.85), 0.0, page_height)
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+def detect_page_body_regions(
+    blocks: list[PageBlock],
+    page_count: int,
+    page_width: float,
+    page_height: float,
+) -> list[BodyRegion | None]:
+    page_map = _group_by_page(blocks)
+    regions: list[BodyRegion | None] = []
+
+    for page_index in range(page_count):
+        page_blocks = page_map.get(page_index, [])
+        regions.append(detect_page_body_region(page_blocks, page_width, page_height))
+
+    return regions
+
+
+def detect_document_body_region_from_pages(
+    page_regions: list[BodyRegion | None],
+    page_width: float,
+    page_height: float,
+) -> BodyRegion | None:
+    valid = [r for r in page_regions if r is not None]
+    if not valid:
+        return None
+
+    x0 = _clamp(_percentile([r.x0 for r in valid], 0.15), 0.0, page_width)
+    x1 = _clamp(_percentile([r.x1 for r in valid], 0.85), 0.0, page_width)
+    y0 = _clamp(_percentile([r.y0 for r in valid], 0.15), 0.0, page_height)
+    y1 = _clamp(_percentile([r.y1 for r in valid], 0.85), 0.0, page_height)
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+# -----------------------------------------------------------------------------
+# Marginalia
+# -----------------------------------------------------------------------------
+
+
+def detect_margin_zones(
+    blocks: list[PageBlock],
+    body: BodyRegion,
+    page_count: int,
+    page_width: float,
+) -> tuple[MarginZone | None, MarginZone | None]:
+    left_pages: set[int] = set()
+    right_pages: set[int] = set()
+    left_x0: list[float] = []
+    left_x1: list[float] = []
+    right_x0: list[float] = []
+    right_x1: list[float] = []
+
+    max_margin_width = page_width * 0.22
+
+    for block in blocks:
+        if not _is_text_like(block):
+            continue
+
+        if block.x1 <= body.x0 and block.width <= max_margin_width:
+            left_pages.add(block.page_index)
+            left_x0.append(block.x0)
+            left_x1.append(block.x1)
+
+        if block.x0 >= body.x1 and block.width <= max_margin_width:
+            right_pages.add(block.page_index)
+            right_x0.append(block.x0)
+            right_x1.append(block.x1)
+
+    left_zone = None
+    if left_pages and len(left_pages) / max(1, page_count) >= 0.10:
+        left_zone = MarginZone(
+            side="left",
+            x0=_percentile(left_x0, 0.10),
+            x1=_percentile(left_x1, 0.90),
+            coverage_ratio=len(left_pages) / page_count,
+            pages_present=len(left_pages),
+        )
+
+    right_zone = None
+    if right_pages and len(right_pages) / max(1, page_count) >= 0.10:
+        right_zone = MarginZone(
+            side="right",
+            x0=_percentile(right_x0, 0.10),
+            x1=_percentile(right_x1, 0.90),
+            coverage_ratio=len(right_pages) / page_count,
+            pages_present=len(right_pages),
+        )
+
+    return left_zone, right_zone
+
+
+def refine_page_body_region(
+    page_region: BodyRegion | None,
+    page_blocks: list[PageBlock],
+    left_margin_zone: MarginZone | None,
+    right_margin_zone: MarginZone | None,
+    page_width: float,
+    page_height: float,
+) -> BodyRegion | None:
+    if page_region is None:
+        return None
+
+    usable: list[PageBlock] = []
+
+    for block in page_blocks:
+        if not _is_text_like(block):
+            continue
+        if left_margin_zone and block.x1 <= left_margin_zone.x1:
+            continue
+        if right_margin_zone and block.x0 >= right_margin_zone.x0:
+            continue
+        usable.append(block)
+
+    if not usable:
+        return page_region
+
+    x0s = [b.x0 for b in usable]
+    x1s = [b.x1 for b in usable]
+    y0s = [b.y0 for b in usable]
+    y1s = [b.y1 for b in usable]
+
+    x0 = _clamp(_percentile(x0s, 0.15), 0.0, page_width)
+    x1 = _clamp(_percentile(x1s, 0.85), 0.0, page_width)
+    y0 = _clamp(_percentile(y0s, 0.15), 0.0, page_height)
+    y1 = _clamp(_percentile(y1s, 0.85), 0.0, page_height)
+
+    if x1 <= x0 or y1 <= y0:
+        return page_region
+
+    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+# -----------------------------------------------------------------------------
+# Column detection from lines
+# -----------------------------------------------------------------------------
+
+
+def extract_text_line_boxes(
+    pdf_path: Path,
+    page_body_regions: list[BodyRegion | None],
+) -> list[ColumnBox]:
+    """
+    Extrahiert horizontale Textzeilen im jeweiligen Seiten-Body.
+
+    Wichtig:
+    - Nur Text aus page.get_text("dict")
+    - Keine Bilder / drawings / image blocks
+    """
+    boxes: list[ColumnBox] = []
+
+    with fitz.open(pdf_path) as doc:
+        for page_index in range(len(doc)):
+            body_region = page_body_regions[page_index]
+            if body_region is None:
+                continue
+
+            page = doc.load_page(page_index)
+            clip = fitz.Rect(
+                body_region.x0,
+                body_region.y0,
+                body_region.x1,
+                body_region.y1,
+            )
+
+            data = page.get_text(
+                "dict",
+                flags=fitz.TEXTFLAGS_TEXT,
+                clip=clip,
+            )
+
+            parity = "odd" if _is_odd_page(page_index) else "even"
+
+            for block in data.get("blocks", []):
+                if "lines" not in block:
+                    continue
+
+                for line in block["lines"]:
+                    if tuple(line.get("dir", (1, 0))) != (1, 0):
+                        continue
+
+                    bbox = line.get("bbox")
+                    if not bbox:
+                        continue
+
+                    x0, y0, x1, y1 = map(float, bbox)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+
+                    text = "".join(
+                        span.get("text", "").strip()
+                        for span in line.get("spans", [])
+                    ).strip()
+                    if len(text) < 2:
+                        continue
+
+                    boxes.append(
+                        ColumnBox(
+                            page_index=page_index,
+                            parity=parity,
+                            x0=x0,
+                            y0=y0,
+                            x1=x1,
+                            y1=y1,
+                        )
+                    )
+
+    return boxes
+
+
+def build_column_compatible_boxes(
+    line_boxes: list[ColumnBox],
+    page_body_regions: list[BodyRegion | None],
+) -> list[ColumnBox]:
+    """
+    Verschmilzt zeilenweise Boxen seitenlokal zu spaltenkompatiblen Boxen.
+    Nur auf Textzeilenbasis.
+    """
+    page_map: dict[int, list[ColumnBox]] = {}
+    for box in line_boxes:
+        page_map.setdefault(box.page_index, []).append(box)
+
+    merged_all: list[ColumnBox] = []
+
+    for page_index, boxes in page_map.items():
+        body_region = page_body_regions[page_index]
+        if body_region is None:
+            continue
+
+        boxes = sorted(boxes, key=lambda b: (b.y0, b.x0))
+        merged: list[ColumnBox] = []
+
+        for box in boxes:
+            if box.width > body_region.width * 0.75:
+                # breite Zeilen sind kein Spaltenkern
+                continue
+
+            attached = False
+
+            for i, existing in enumerate(merged):
+                overlap = min(existing.x1, box.x1) - max(existing.x0, box.x0)
+                min_width = max(1.0, min(existing.width, box.width))
+                overlap_ratio = overlap / min_width if min_width > 0 else 0.0
+
+                vertical_gap = box.y0 - existing.y1
+
+                same_lane = overlap_ratio >= 0.35
+                near_enough = vertical_gap <= max(existing.height, box.height) * 1.5
+
+                if same_lane and near_enough:
+                    merged[i] = ColumnBox(
+                        page_index=existing.page_index,
+                        parity=existing.parity,
+                        x0=min(existing.x0, box.x0),
+                        y0=min(existing.y0, box.y0),
+                        x1=max(existing.x1, box.x1),
+                        y1=max(existing.y1, box.y1),
+                    )
+                    attached = True
+                    break
+
+            if not attached:
+                merged.append(box)
+
+        merged_all.extend(merged)
+
+    return merged_all
+
+
+def split_line_boxes_by_page_role(
+    line_boxes: list[ColumnBox],
+    page_body_regions: list[BodyRegion | None],
+    min_width_abs: float = 20.0,
+    wide_width_ratio: float = 0.72,
+) -> tuple[
+    dict[int, list[tuple[float, float]]],
+    dict[int, list[tuple[float, float]]],
+]:
+    """
+    Trennt Textzeilen in:
+    - column candidate lines
+    - wide text lines
+
+    Rückgabe:
+        candidate_by_page, wide_by_page
+        jeweils {page_index: [(x0_rel, x1_rel), ...]}
+    """
+    candidate_by_page: dict[int, list[tuple[float, float]]] = {}
+    wide_by_page: dict[int, list[tuple[float, float]]] = {}
+
+    for box in line_boxes:
+        body = page_body_regions[box.page_index]
+        if body is None:
+            continue
+
+        if box.width < min_width_abs:
+            continue
+
+        x0_rel = (box.x0 - body.x0) / max(1e-6, body.width)
+        x1_rel = (box.x1 - body.x0) / max(1e-6, body.width)
+
+        x0_rel = max(0.0, min(1.0, x0_rel))
+        x1_rel = max(0.0, min(1.0, x1_rel))
+
+        if x1_rel <= x0_rel:
+            continue
+
+        width_rel = x1_rel - x0_rel
+
+        if width_rel >= wide_width_ratio:
+            wide_by_page.setdefault(box.page_index, []).append((x0_rel, x1_rel))
+        else:
+            candidate_by_page.setdefault(box.page_index, []).append((x0_rel, x1_rel))
+
+    return candidate_by_page, wide_by_page
+
+
+def _cluster_positions_1d(
+    values: list[float],
+    tolerance: float = 0.06,
+    min_cluster_size: int = 2,
+) -> list[float]:
+    """
+    Einfache 1D-Clusterung für linke/rechte Kanten.
+    Rückgabe: Clusterzentren.
+    """
+    if not values:
+        return []
+
+    values = sorted(values)
+    clusters: list[list[float]] = [[values[0]]]
+
+    for value in values[1:]:
+        if abs(value - clusters[-1][-1]) <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+
+    centers = [
+        _median(cluster)
+        for cluster in clusters
+        if len(cluster) >= min_cluster_size
+    ]
+    return centers
+
+
+def page_column_hypothesis(
+    page_lines_rel: list[tuple[float, float]],
+    wide_lines_rel: list[tuple[float, float]] | None = None,
+    bins: int = 80,
+    threshold_ratio: float = 0.25,
+    min_lane_width_rel: float = 0.12,
+) -> tuple[int, list[tuple[float, float]], float]:
+    """
+    Liefert:
+      (column_count, lane_ranges_rel, score)
+
+    Wichtig:
+    - basiert primär auf column candidate lines
+    - wide lines zerstören das Mehrspaltenmodell nicht
+    - kombiniert Occupancy + Cluster der linken Kanten
+    """
+    wide_lines_rel = wide_lines_rel or []
+
+    if not page_lines_rel:
+        return 0, [], 0.0
+
+    occupied = [0] * bins
+
+    for x0_rel, x1_rel in page_lines_rel:
+        start = max(0, min(bins - 1, int(x0_rel * bins)))
+        end = max(0, min(bins - 1, int(x1_rel * bins)))
+        for i in range(start, end + 1):
+            occupied[i] += 1
+
+    max_occ = max(occupied) if occupied else 0
+    if max_occ == 0:
+        return 0, [], 0.0
+
+    threshold = max_occ * threshold_ratio
+    occ = _smooth([float(v) for v in occupied], window=5)
+
+    lanes: list[tuple[float, float]] = []
+    i = 0
+    while i < bins:
+        if occ[i] < threshold:
+            i += 1
+            continue
+
+        j = i
+        while j + 1 < bins and occ[j + 1] >= threshold:
+            j += 1
+
+        x0_rel = i / bins
+        x1_rel = (j + 1) / bins
+
+        if (x1_rel - x0_rel) >= min_lane_width_rel:
+            lanes.append((x0_rel, x1_rel))
+
+        i = j + 1
+
+    # Zusätzliche Stütze: Cluster der linken Kanten
+    left_edges = [x0 for x0, _x1 in page_lines_rel]
+    x0_clusters = _cluster_positions_1d(
+        left_edges,
+        tolerance=0.06,
+        min_cluster_size=max(2, int(len(left_edges) * 0.15)),
+    )
+
+    occupancy_count = len(lanes)
+    cluster_count = len(x0_clusters)
+
+    inferred_count = max(occupancy_count, cluster_count, 1)
+
+    # Schutz gegen Übersegmentierung
+    if inferred_count > 3:
+        inferred_count = 3
+
+    # Wenn occupancy nur 1 ergibt, aber die linken Kanten stabil 2 Cluster haben,
+    # ist das ein starkes Zweispaltensignal.
+    if occupancy_count == 1 and cluster_count >= 2:
+        inferred_count = 2
+
+    widths = [x1 - x0 for x0, x1 in lanes] if lanes else []
+    wide_ratio = (
+        len(wide_lines_rel) / max(1, len(page_lines_rel) + len(wide_lines_rel))
+    )
+
+    score = 0.0
+    score += min(1.0, 0.35 * inferred_count)
+    score += min(0.35, 0.35 * _mean(widths)) if widths else 0.0
+    score += min(0.30, 0.15 * cluster_count)
+    score -= min(0.15, 0.10 * wide_ratio)  # viele breite Zeilen machen die Seite gemischter
+
+    score = max(0.0, min(1.0, score))
+
+    # Falls Cluster 2 sagen, aber Occupancy keine klaren Lanes trennt,
+    # bauen wir aus den Clusterzentren grobe Lanes.
+    if inferred_count >= 2 and len(lanes) <= 1 and len(x0_clusters) >= 2:
+        centers = sorted(x0_clusters[:inferred_count])
+        synthetic: list[tuple[float, float]] = []
+        for idx, center in enumerate(centers):
+            if idx + 1 < len(centers):
+                right = min(1.0, (center + centers[idx + 1]) / 2.0)
+            else:
+                right = 1.0
+            left = center
+            if right - left >= min_lane_width_rel:
+                synthetic.append((left, right))
+        if synthetic:
+            lanes = synthetic
+
+    if not lanes and inferred_count == 1:
+        return 1, [], max(score, 0.1)
+
+    return inferred_count, lanes, score
+
+
+def build_page_column_hypotheses(
+    line_boxes: list[ColumnBox],
+    page_body_regions: list[BodyRegion | None],
+    page_count: int,
+) -> list[PageColumnHypothesis]:
+    candidate_by_page, wide_by_page = split_line_boxes_by_page_role(
+        line_boxes=line_boxes,
+        page_body_regions=page_body_regions,
+    )
+
+    hypotheses: list[PageColumnHypothesis] = []
+
+    for page_index in range(page_count):
+        page_lines = candidate_by_page.get(page_index, [])
+        wide_lines = wide_by_page.get(page_index, [])
+
+        count, lanes, score = page_column_hypothesis(
+            page_lines_rel=page_lines,
+            wide_lines_rel=wide_lines,
+        )
+
+        hypotheses.append(
+            PageColumnHypothesis(
+                page_index=page_index,
+                column_count=max(1, count) if (page_lines or wide_lines) else 0,
+                lane_ranges_rel=lanes,
+                score=score,
+                candidate_line_count=len(page_lines),
+                wide_line_count=len(wide_lines),
+            )
+        )
+
+    return hypotheses
+
+
+def summarize_page_column_hypotheses(
+    hypotheses: list[PageColumnHypothesis],
+    page_count: int,
+) -> dict[str, object]:
+    nonzero = [h for h in hypotheses if h.column_count > 0]
+    if not nonzero:
+        return {
+            "dominant_column_count": 0,
+            "coverage_by_count": {},
+            "mean_score": 0.0,
+            "has_secondary_two_column_mode": False,
+            "two_column_coverage": 0.0,
+            "mixed_layout": False,
+        }
+
+    coverage_by_count: dict[int, int] = {}
+    for hyp in nonzero:
+        coverage_by_count[hyp.column_count] = coverage_by_count.get(hyp.column_count, 0) + 1
+
+    dominant_column_count = max(
+        coverage_by_count.items(),
+        key=lambda item: item[1],
+    )[0]
+
+    coverage_by_count_ratio = {
+        k: v / page_count for k, v in sorted(coverage_by_count.items())
+    }
+
+    two_column_coverage = coverage_by_count_ratio.get(2, 0.0)
+    has_secondary_two_column_mode = two_column_coverage >= 0.20
+    mixed_layout = (
+        coverage_by_count_ratio.get(1, 0.0) >= 0.30
+        and two_column_coverage >= 0.20
+    )
+
+    return {
+        "dominant_column_count": dominant_column_count,
+        "coverage_by_count": coverage_by_count_ratio,
+        "mean_score": _mean([h.score for h in nonzero]),
+        "has_secondary_two_column_mode": has_secondary_two_column_mode,
+        "two_column_coverage": two_column_coverage,
+        "mixed_layout": mixed_layout,
+    }
+
+
+def _relative_lane_intervals(
+    boxes: list[ColumnBox],
+    page_body_regions: list[BodyRegion | None],
+) -> list[tuple[str, float, float, int]]:
+    result: list[tuple[str, float, float, int]] = []
+
+    for box in boxes:
+        body = page_body_regions[box.page_index]
+        if body is None:
+            continue
+
+        body_width = max(1e-6, body.width)
+        x0_rel = (box.x0 - body.x0) / body_width
+        x1_rel = (box.x1 - body.x0) / body_width
+
+        x0_rel = max(0.0, min(1.0, x0_rel))
+        x1_rel = max(0.0, min(1.0, x1_rel))
+
+        if x1_rel <= x0_rel:
+            continue
+
+        # nur echte column candidate boxes, keine breiten Zeilen
+        if (x1_rel - x0_rel) >= 0.72:
+            continue
+
+        result.append((box.parity, x0_rel, x1_rel, box.page_index))
+
+    return result
+
+
+def _detect_lanes_from_intervals(
+    intervals: list[tuple[str, float, float, int]],
+    page_count: int,
+    parity: str,
+    bins: int = 120,
+) -> list[ColumnLane]:
+    if parity == "odd":
+        intervals = [it for it in intervals if it[0] == "odd"]
+        eligible_pages = len([p for p in range(page_count) if _is_odd_page(p)])
+    elif parity == "even":
+        intervals = [it for it in intervals if it[0] == "even"]
+        eligible_pages = len([p for p in range(page_count) if not _is_odd_page(p)])
+    else:
+        eligible_pages = page_count
+
+    if not intervals or eligible_pages == 0:
+        return []
+
+    pages_per_bin: list[set[int]] = [set() for _ in range(bins)]
+
+    for _parity, x0_rel, x1_rel, page_index in intervals:
+        start = max(0, min(bins - 1, int(x0_rel * bins)))
+        end = max(0, min(bins - 1, int(x1_rel * bins)))
+
+        for i in range(start, end + 1):
+            pages_per_bin[i].add(page_index)
+
+    raw_coverage = [len(s) / eligible_pages for s in pages_per_bin]
+    page_coverage = _smooth(raw_coverage, window=5)
+
+    threshold = 0.18
+    lanes: list[ColumnLane] = []
+    i = 0
+    lane_index = 0
+
+    while i < bins:
+        if page_coverage[i] < threshold:
+            i += 1
+            continue
+
+        j = i
+        while j + 1 < bins and page_coverage[j + 1] >= threshold:
+            j += 1
+
+        x0_rel = i / bins
+        x1_rel = (j + 1) / bins
+        pages_present = len(set().union(*pages_per_bin[i : j + 1]))
+        coverage_ratio = pages_present / eligible_pages
+        lane_width = x1_rel - x0_rel
+
+        if coverage_ratio >= 0.18 and lane_width >= 0.08:
+            lanes.append(
+                ColumnLane(
+                    index=lane_index,
+                    x0=x0_rel,
+                    x1=x1_rel,
+                    pages_present=pages_present,
+                    coverage_ratio=coverage_ratio,
+                    block_count=0,
+                )
+            )
+            lane_index += 1
+
+        i = j + 1
+
+    return lanes
+
+
+def _merge_close_or_overlapping_lanes(
+    lanes: list[ColumnLane],
+    body_width: float,
+) -> list[ColumnLane]:
+    if not lanes:
+        return []
+
+    lanes = sorted(lanes, key=lambda lane: lane.x0)
+    merged: list[ColumnLane] = [lanes[0]]
+
+    for lane in lanes[1:]:
+        prev = merged[-1]
+
+        gap = lane.x0 - prev.x1
+        overlap = min(prev.x1, lane.x1) - max(prev.x0, lane.x0)
+        min_width = max(1e-6, min(prev.width, lane.width))
+        overlap_ratio = max(0.0, overlap) / min_width
+
+        if gap <= body_width * 0.02 or overlap_ratio >= 0.20:
+            merged[-1] = ColumnLane(
+                index=prev.index,
+                x0=min(prev.x0, lane.x0),
+                x1=max(prev.x1, lane.x1),
+                pages_present=max(prev.pages_present, lane.pages_present),
+                coverage_ratio=max(prev.coverage_ratio, lane.coverage_ratio),
+                block_count=max(prev.block_count, lane.block_count),
+            )
+        else:
+            merged.append(lane)
+
+    for i, lane in enumerate(merged):
+        lane.index = i
+
+    return merged
+
+
+def detect_column_lanes(
+    pdf_path: Path,
+    page_body_regions: list[BodyRegion | None],
+    page_count: int,
+    document_body_region: BodyRegion,
+) -> tuple[int, list[float], float | None, list[ColumnLane], list[ColumnBox], dict[str, object]]:
+    line_boxes = extract_text_line_boxes(
+        pdf_path=pdf_path,
+        page_body_regions=page_body_regions,
+    )
+
+    column_boxes = build_column_compatible_boxes(
+        line_boxes=line_boxes,
+        page_body_regions=page_body_regions,
+    )
+
+    rel_intervals = _relative_lane_intervals(
+        boxes=column_boxes,
+        page_body_regions=page_body_regions,
+    )
+
+    lanes_odd = _detect_lanes_from_intervals(rel_intervals, page_count, "odd")
+    lanes_even = _detect_lanes_from_intervals(rel_intervals, page_count, "even")
+
+    lanes_all: list[ColumnLane] = []
+
+    def overlap(a: ColumnLane, b: ColumnLane) -> float:
+        inter = min(a.x1, b.x1) - max(a.x0, b.x0)
+        if inter <= 0:
+            return 0.0
+        denom = max(1e-6, min(a.width, b.width))
+        return inter / denom
+
+    used_even: set[int] = set()
+    lane_index = 0
+
+    for odd_lane in lanes_odd:
+        best_j = None
+        best_overlap = 0.0
+        for j, even_lane in enumerate(lanes_even):
+            if j in used_even:
+                continue
+            ov = overlap(odd_lane, even_lane)
+            if ov > best_overlap:
+                best_overlap = ov
+                best_j = j
+
+        if best_j is not None and best_overlap >= 0.35:
+            even_lane = lanes_even[best_j]
+            used_even.add(best_j)
+            lanes_all.append(
+                ColumnLane(
+                    index=lane_index,
+                    x0=min(odd_lane.x0, even_lane.x0),
+                    x1=max(odd_lane.x1, even_lane.x1),
+                    pages_present=max(odd_lane.pages_present, even_lane.pages_present),
+                    coverage_ratio=max(odd_lane.coverage_ratio, even_lane.coverage_ratio),
+                    block_count=len(column_boxes),
+                )
+            )
+            lane_index += 1
+
+    if not lanes_all:
+        dominant = lanes_odd if len(lanes_odd) >= len(lanes_even) else lanes_even
+        for lane in dominant:
+            lanes_all.append(
+                ColumnLane(
+                    index=lane_index,
+                    x0=lane.x0,
+                    x1=lane.x1,
+                    pages_present=lane.pages_present,
+                    coverage_ratio=lane.coverage_ratio,
+                    block_count=len(column_boxes),
+                )
+            )
+            lane_index += 1
+
+    abs_lanes: list[ColumnLane] = []
+    for lane in lanes_all:
+        abs_lanes.append(
+            ColumnLane(
+                index=lane.index,
+                x0=document_body_region.x0 + lane.x0 * document_body_region.width,
+                x1=document_body_region.x0 + lane.x1 * document_body_region.width,
+                pages_present=lane.pages_present,
+                coverage_ratio=lane.coverage_ratio,
+                block_count=lane.block_count,
+            )
+        )
+
+    abs_lanes = _merge_close_or_overlapping_lanes(abs_lanes, document_body_region.width)
+    abs_lanes = [
+        lane for lane in abs_lanes
+        if lane.width >= document_body_region.width * 0.18
+    ]
+
+    abs_lanes.sort(key=lambda l: l.x0)
+    for i, lane in enumerate(abs_lanes):
+        lane.index = i
+
+    column_count = len(abs_lanes) if abs_lanes else 1
+
+    if not abs_lanes:
+        widths = [document_body_region.width]
+        gap = None
+    else:
+        widths = [lane.width for lane in abs_lanes]
+        gaps = [
+            max(0.0, right.x0 - left.x1)
+            for left, right in zip(abs_lanes, abs_lanes[1:])
+        ]
+        gap = _mean(gaps) if gaps else None
+
+    diagnostics = {
+        "line_box_count": len(line_boxes),
+        "column_box_count": len(column_boxes),
+        "lanes_odd": [lane.to_dict() for lane in lanes_odd],
+        "lanes_even": [lane.to_dict() for lane in lanes_even],
+        "lanes_all_relative": [lane.to_dict() for lane in lanes_all],
+    }
+
+    if column_count == 1 and abs_lanes:
+        if abs_lanes[0].width >= document_body_region.width * 0.85:
+            return 1, [document_body_region.width], None, [], column_boxes, diagnostics
+
+    if page_count < 6 and column_count > 2:
+        return 1, [document_body_region.width], None, [], column_boxes, diagnostics
+
+    return column_count, widths, gap, abs_lanes, column_boxes, diagnostics
+
+
+# -----------------------------------------------------------------------------
+# Layout signatures and patterns
+# -----------------------------------------------------------------------------
+
+
+def build_page_layout_signatures(
+    blocks: list[PageBlock],
+    page_body_regions: list[BodyRegion | None],
+    header_band: FurnitureBand | None,
+    footer_band: FurnitureBand | None,
+    column_boxes: list[ColumnBox],
+    page_column_hypotheses: list[PageColumnHypothesis],
+    page_count: int,
+) -> list[PageLayoutSignature]:
+    text_page_map = _group_by_page([b for b in blocks if _is_text_like(b)])
+
+    box_page_map: dict[int, list[ColumnBox]] = {}
+    for box in column_boxes:
+        box_page_map.setdefault(box.page_index, []).append(box)
+
+    signatures: list[PageLayoutSignature] = []
+
+    for page_index in range(page_count):
+        page_blocks = text_page_map.get(page_index, [])
+        page_boxes = box_page_map.get(page_index, [])
+        page_body = page_body_regions[page_index]
+        hyp = page_column_hypotheses[page_index]
+
+        active_lane_ranges_abs: list[tuple[float, float]] = []
+        if page_body is not None:
+            for x0_rel, x1_rel in hyp.lane_ranges_rel:
+                active_lane_ranges_abs.append(
+                    (
+                        page_body.x0 + x0_rel * page_body.width,
+                        page_body.x0 + x1_rel * page_body.width,
+                    )
+                )
+
+        signature = PageLayoutSignature(
+            page_index=page_index,
+            page_number=page_index + 1,
+            parity="odd" if _is_odd_page(page_index) else "even",
+            has_header=header_band is not None,
+            has_footer=footer_band is not None,
+            body_x0=page_body.x0 if page_body else None,
+            body_x1=page_body.x1 if page_body else None,
+            body_y0=page_body.y0 if page_body else None,
+            body_y1=page_body.y1 if page_body else None,
+            page_column_count=max(1, hyp.column_count) if page_body else 0,
+            active_lane_indices=list(range(len(hyp.lane_ranges_rel))),
+            active_lane_ranges=active_lane_ranges_abs,
+            text_block_count=len(page_blocks),
+            column_box_count=len(page_boxes),
+            body_block_count=len(page_blocks),
+        )
+        signatures.append(signature)
+
+    return signatures
+
+
+def build_layout_patterns(
+    signatures: list[PageLayoutSignature],
+    total_pages: int,
+) -> list[LayoutPattern]:
+    grouped: dict[str, list[PageLayoutSignature]] = {}
+    for sig in signatures:
+        grouped.setdefault(sig.layout_key(), []).append(sig)
+
+    patterns: list[LayoutPattern] = []
+
+    for key, sigs in grouped.items():
+        page_indexes = sorted(sig.page_index for sig in sigs)
+        coverage_ratio = len(sigs) / max(1, total_pages)
+
+        body_x0_values = [s.body_x0 for s in sigs if s.body_x0 is not None]
+        body_x1_values = [s.body_x1 for s in sigs if s.body_x1 is not None]
+        body_y0_values = [s.body_y0 for s in sigs if s.body_y0 is not None]
+        body_y1_values = [s.body_y1 for s in sigs if s.body_y1 is not None]
+
+        body_x0_stats = _robust_stats(body_x0_values)
+        body_x1_stats = _robust_stats(body_x1_values)
+        body_y0_stats = _robust_stats(body_y0_values)
+        body_y1_stats = _robust_stats(body_y1_values)
+
+        column_counts = [float(s.page_column_count) for s in sigs]
+        col_med = _median(column_counts) if column_counts else None
+        col_mad = _mad(column_counts, col_med) if column_counts else None
+
+        mad_values = [
+            stats.mad
+            for stats in [body_x0_stats, body_x1_stats, body_y0_stats, body_y1_stats]
+            if stats is not None
+        ]
+        mean_mad = _mean(mad_values) if mad_values else 0.0
+
+        stability_score = 1.0 / (1.0 + mean_mad)
+
+        sample_factor = min(1.0, len(sigs) / 5.0)
+        coverage_score = coverage_ratio
+
+        confidence_score = (
+            0.45 * stability_score
+            + 0.35 * coverage_score
+            + 0.20 * sample_factor
+        )
+
+        patterns.append(
+            LayoutPattern(
+                key=key,
+                pages_present=len(sigs),
+                total_pages=total_pages,
+                coverage_ratio=coverage_ratio,
+                page_indexes=page_indexes,
+                page_runs=_page_runs(page_indexes),
+                body_x0_stats=body_x0_stats,
+                body_x1_stats=body_x1_stats,
+                body_y0_stats=body_y0_stats,
+                body_y1_stats=body_y1_stats,
+                column_count_median=col_med,
+                column_count_mad=col_mad,
+                stability_score=stability_score,
+                confidence_score=confidence_score,
+            )
+        )
+
+    patterns.sort(
+        key=lambda p: (p.coverage_ratio, p.confidence_score or 0.0),
+        reverse=True,
+    )
+    return patterns
+
+
+# -----------------------------------------------------------------------------
+# Public builder
+# -----------------------------------------------------------------------------
+
+
+def build_geometry_profile(pdf_path: Path) -> GeometryProfile:
+    blocks, page_count, page_width, page_height = extract_page_blocks(pdf_path)
+
+    image_block_count = len([b for b in blocks if b.block_type == 1])
+
+    (
+        header_band,
+        footer_band,
+        header_band_odd,
+        header_band_even,
+        footer_band_odd,
+        footer_band_even,
+        furniture_diag,
+    ) = detect_repeated_furniture_bands(
+        blocks=blocks,
+        page_count=page_count,
+        page_height=page_height,
+    )
+
+    non_furniture_blocks = _filter_out_furniture(
+        blocks=blocks,
+        header_band=header_band,
+        footer_band=footer_band,
+    )
+
+    page_body_regions = detect_page_body_regions(
+        blocks=non_furniture_blocks,
+        page_count=page_count,
+        page_width=page_width,
+        page_height=page_height,
+    )
+
+    document_body = detect_document_body_region_from_pages(
+        page_regions=page_body_regions,
+        page_width=page_width,
+        page_height=page_height,
+    )
+
+    if document_body is None:
+        document_body = BodyRegion(
+            x0=0.0,
+            y0=header_band.y1 if header_band else 0.0,
+            x1=page_width,
+            y1=footer_band.y0 if footer_band else page_height,
+        )
+
+    left_margin_zone, right_margin_zone = detect_margin_zones(
+        blocks=non_furniture_blocks,
+        body=document_body,
+        page_count=page_count,
+        page_width=page_width,
+    )
+
+    page_map = _group_by_page(non_furniture_blocks)
+    refined_page_bodies: list[BodyRegion | None] = []
+    for page_index in range(page_count):
+        refined_page_bodies.append(
+            refine_page_body_region(
+                page_region=page_body_regions[page_index],
+                page_blocks=page_map.get(page_index, []),
+                left_margin_zone=left_margin_zone,
+                right_margin_zone=right_margin_zone,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+
+    page_body_regions = refined_page_bodies
+
+    document_body = detect_document_body_region_from_pages(
+        page_regions=page_body_regions,
+        page_width=page_width,
+        page_height=page_height,
+    ) or document_body
+
+    line_boxes = extract_text_line_boxes(
+        pdf_path=pdf_path,
+        page_body_regions=page_body_regions,
+    )
+
+    column_boxes = build_column_compatible_boxes(
+        line_boxes=line_boxes,
+        page_body_regions=page_body_regions,
+    )
+
+    page_column_hypotheses = build_page_column_hypotheses(
+        line_boxes=line_boxes,
+        page_body_regions=page_body_regions,
+        page_count=page_count,
+    )
+
+    page_column_summary = summarize_page_column_hypotheses(
+        hypotheses=page_column_hypotheses,
+        page_count=page_count,
+    )
+
+    (
+        column_count,
+        column_widths,
+        column_gap,
+        column_lanes,
+        _column_boxes_again,
+        column_diag,
+    ) = detect_column_lanes(
+        pdf_path=pdf_path,
+        page_body_regions=page_body_regions,
+        page_count=page_count,
+        document_body_region=document_body,
+    )
+
+    if column_count == 1:
+        if page_column_summary["dominant_column_count"] > 1:
+            column_count = int(page_column_summary["dominant_column_count"])
+        elif page_column_summary["has_secondary_two_column_mode"]:
+            column_count = 2
+
+    page_layout_signatures = build_page_layout_signatures(
+        blocks=non_furniture_blocks,
+        page_body_regions=page_body_regions,
+        header_band=header_band,
+        footer_band=footer_band,
+        column_boxes=column_boxes,
+        page_column_hypotheses=page_column_hypotheses,
+        page_count=page_count,
+    )
+
+    layout_patterns = build_layout_patterns(
+        signatures=page_layout_signatures,
+        total_pages=page_count,
+    )
+
+    header_bottom = header_band.y1 if header_band else 0.0
+    footer_top = footer_band.y0 if footer_band else page_height
+
+    diagnostics = {
+        "raw_block_count": len(blocks),
+        "image_block_count": image_block_count,
+        "text_block_count": len([b for b in blocks if _is_text_like(b)]),
+        "non_furniture_text_block_count": len(non_furniture_blocks),
+        "furniture_detection": furniture_diag,
+        "column_detection": column_diag,
+        "body_width": document_body.width,
+        "body_height": document_body.height,
+        "page_body_region_count": len([r for r in page_body_regions if r is not None]),
+        "layout_pattern_count": len(layout_patterns),
+        "page_column_hypotheses": [h.to_dict() for h in page_column_hypotheses],
+        "page_column_summary": page_column_summary,
+    }
+
+    return GeometryProfile(
+        page_count=page_count,
+        paper_width=page_width,
+        paper_height=page_height,
+        text_left=document_body.x0,
+        text_right=document_body.x1,
+        text_top=document_body.y0,
+        text_bottom=document_body.y1,
+        header_bottom=header_bottom,
+        footer_top=footer_top,
+        margin_left=document_body.x0,
+        margin_right=max(0.0, page_width - document_body.x1),
+        column_count=column_count,
+        column_widths=column_widths,
+        column_gap=column_gap,
+        column_lanes=column_lanes,
+        header_band=header_band,
+        footer_band=footer_band,
+        header_band_odd=header_band_odd,
+        header_band_even=header_band_even,
+        footer_band_odd=footer_band_odd,
+        footer_band_even=footer_band_even,
+        left_margin_zone=left_margin_zone,
+        right_margin_zone=right_margin_zone,
+        body_region=document_body,
+        page_body_regions=page_body_regions,
+        page_layout_signatures=page_layout_signatures,
+        layout_patterns=layout_patterns,
+        diagnostics=diagnostics,
+    )
