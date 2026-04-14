@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-import fitz
+import pymupdf as fitz
 
 from atlas.common.hashing import sha256_file
 from atlas.db.connection import get_connection

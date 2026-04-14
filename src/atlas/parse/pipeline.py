@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 
 from .config import ParseConfig
 from .errors import AdapterError, ExtractionError

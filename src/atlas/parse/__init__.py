@@ -11,7 +11,11 @@ aus einzelnen PDFs. Es ist ein internes Werkzeug von Atlas, nicht dessen Core.
 - ParseResult
 """
 
-from .api import analyze_document
-from .models import ParseResult
+from __future__ import annotations
 
-__all__ = ["analyze_document", "ParseResult"]
+__all__ = ["analyze_document"]
+
+
+def analyze_document(*args, **kwargs):
+    from .api import analyze_document as _analyze_document
+    return _analyze_document(*args, **kwargs)

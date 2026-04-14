@@ -5,7 +5,21 @@ from pathlib import Path
 from statistics import median
 import math
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
+
+from .zones import (
+    BodyRegion,
+    FurnitureBand,
+    MarginZone,
+    detect_document_body_region_from_pages,
+    detect_margin_zones,
+    detect_page_body_regions,
+    detect_repeated_furniture_bands,
+    refine_page_body_region,
+    filter_out_furniture,
+    page_matches_band_candidate,
+    decide_page_has_furniture,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -89,58 +103,6 @@ class ColumnBox:
 # -----------------------------------------------------------------------------
 # Geometry model
 # -----------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class FurnitureBand:
-    side: str  # "top" | "bottom"
-    y0: float
-    y1: float
-    coverage_ratio: float
-    pages_present: int
-    page_parity: str = "all"  # "all" | "odd" | "even"
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y1 - self.y0)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass(slots=True)
-class MarginZone:
-    side: str  # "left" | "right"
-    x0: float
-    x1: float
-    coverage_ratio: float
-    pages_present: int
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x1 - self.x0)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass(slots=True)
-class BodyRegion:
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x1 - self.x0)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y1 - self.y0)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -482,403 +444,6 @@ def extract_page_blocks(pdf_path: Path) -> tuple[list[PageBlock], int, float, fl
 
 
 # -----------------------------------------------------------------------------
-# Furniture detection
-# -----------------------------------------------------------------------------
-
-
-def _top_edge_blocks(page_blocks: list[PageBlock], page_height: float) -> list[PageBlock]:
-    top_limit = page_height * 0.16
-    max_height = page_height * 0.06
-    return [
-        b
-        for b in page_blocks
-        if _is_text_like(b)
-        and b.y0 <= top_limit
-        and b.height <= max_height
-    ]
-
-
-def _bottom_edge_blocks(page_blocks: list[PageBlock], page_height: float) -> list[PageBlock]:
-    bottom_limit = page_height * 0.84
-    max_height = page_height * 0.06
-    return [
-        b
-        for b in page_blocks
-        if _is_text_like(b)
-        and b.y1 >= bottom_limit
-        and b.height <= max_height
-    ]
-
-
-def _build_page_band_candidate(
-    page_blocks: list[PageBlock],
-    page_height: float,
-    side: str,
-) -> tuple[float, float] | None:
-    candidates = (
-        _top_edge_blocks(page_blocks, page_height)
-        if side == "top"
-        else _bottom_edge_blocks(page_blocks, page_height)
-    )
-    if not candidates:
-        return None
-
-    y0 = min(b.y0 for b in candidates)
-    y1 = max(b.y1 for b in candidates)
-
-    max_band_height = page_height * 0.075
-    if (y1 - y0) > max_band_height:
-        return None
-
-    return (y0, y1)
-
-
-def _page_band_candidates(
-    page_map: dict[int, list[PageBlock]],
-    page_height: float,
-    side: str,
-) -> dict[int, tuple[float, float]]:
-    result: dict[int, tuple[float, float]] = {}
-    for page_index, page_blocks in page_map.items():
-        band = _build_page_band_candidate(page_blocks, page_height, side)
-        if band is not None:
-            result[page_index] = band
-    return result
-
-
-def _aggregate_band_candidates(
-    candidates: dict[int, tuple[float, float]],
-    page_indexes: list[int],
-    side: str,
-    page_parity: str,
-    page_height: float,
-) -> FurnitureBand | None:
-    if page_parity == "odd":
-        eligible_pages = [p for p in page_indexes if _is_odd_page(p)]
-    elif page_parity == "even":
-        eligible_pages = [p for p in page_indexes if not _is_odd_page(p)]
-    else:
-        eligible_pages = list(page_indexes)
-
-    if not eligible_pages:
-        return None
-
-    present = [(p, candidates[p]) for p in eligible_pages if p in candidates]
-    if not present:
-        return None
-
-    coverage_ratio = len(present) / len(eligible_pages)
-    if coverage_ratio < 0.45:
-        return None
-
-    y0_values = [band[0] for _, band in present]
-    y1_values = [band[1] for _, band in present]
-
-    med_y0 = _median(y0_values)
-    med_y1 = _median(y1_values)
-
-    tol = page_height * 0.018
-    filtered = [
-        (p, band)
-        for p, band in present
-        if abs(band[0] - med_y0) <= tol and abs(band[1] - med_y1) <= tol
-    ]
-
-    if not filtered:
-        return None
-
-    filtered_coverage = len(filtered) / len(eligible_pages)
-    if filtered_coverage < 0.40:
-        return None
-
-    fy0 = _percentile([band[0] for _, band in filtered], 0.20)
-    fy1 = _percentile([band[1] for _, band in filtered], 0.80)
-
-    if fy1 <= fy0:
-        return None
-
-    max_band_height = page_height * 0.08
-    if (fy1 - fy0) > max_band_height:
-        return None
-
-    return FurnitureBand(
-        side=side,
-        y0=fy0,
-        y1=fy1,
-        coverage_ratio=filtered_coverage,
-        pages_present=len(filtered),
-        page_parity=page_parity,
-    )
-
-
-def _merge_top_bands(bands: list[FurnitureBand | None]) -> FurnitureBand | None:
-    valid = [b for b in bands if b is not None]
-    if not valid:
-        return None
-    return FurnitureBand(
-        side="top",
-        y0=min(b.y0 for b in valid),
-        y1=max(b.y1 for b in valid),
-        coverage_ratio=max(b.coverage_ratio for b in valid),
-        pages_present=max(b.pages_present for b in valid),
-        page_parity="all",
-    )
-
-
-def _merge_bottom_bands(bands: list[FurnitureBand | None]) -> FurnitureBand | None:
-    valid = [b for b in bands if b is not None]
-    if not valid:
-        return None
-    return FurnitureBand(
-        side="bottom",
-        y0=min(b.y0 for b in valid),
-        y1=max(b.y1 for b in valid),
-        coverage_ratio=max(b.coverage_ratio for b in valid),
-        pages_present=max(b.pages_present for b in valid),
-        page_parity="all",
-    )
-
-
-def detect_repeated_furniture_bands(
-    blocks: list[PageBlock],
-    page_count: int,
-    page_height: float,
-) -> tuple[
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    dict[str, object],
-]:
-    text_blocks = [b for b in blocks if _is_text_like(b)]
-    page_map = _group_by_page(text_blocks)
-    page_indexes = list(range(page_count))
-
-    top_candidates = _page_band_candidates(page_map, page_height, "top")
-    bottom_candidates = _page_band_candidates(page_map, page_height, "bottom")
-
-    header_odd = _aggregate_band_candidates(
-        top_candidates, page_indexes, "top", "odd", page_height
-    )
-    header_even = _aggregate_band_candidates(
-        top_candidates, page_indexes, "top", "even", page_height
-    )
-    footer_odd = _aggregate_band_candidates(
-        bottom_candidates, page_indexes, "bottom", "odd", page_height
-    )
-    footer_even = _aggregate_band_candidates(
-        bottom_candidates, page_indexes, "bottom", "even", page_height
-    )
-
-    header_band = _merge_top_bands([header_odd, header_even])
-    footer_band = _merge_bottom_bands([footer_odd, footer_even])
-
-    diagnostics = {
-        "top_page_candidates_count": len(top_candidates),
-        "bottom_page_candidates_count": len(bottom_candidates),
-        "header_odd": header_odd.to_dict() if header_odd else None,
-        "header_even": header_even.to_dict() if header_even else None,
-        "footer_odd": footer_odd.to_dict() if footer_odd else None,
-        "footer_even": footer_even.to_dict() if footer_even else None,
-    }
-
-    return (
-        header_band,
-        footer_band,
-        header_odd,
-        header_even,
-        footer_odd,
-        footer_even,
-        diagnostics,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Body regions
-# -----------------------------------------------------------------------------
-
-
-def _filter_out_furniture(
-    blocks: list[PageBlock],
-    header_band: FurnitureBand | None,
-    footer_band: FurnitureBand | None,
-) -> list[PageBlock]:
-    result: list[PageBlock] = []
-
-    for block in blocks:
-        if not _is_text_like(block):
-            continue
-        if header_band and block.y1 <= header_band.y1 + 2.0:
-            continue
-        if footer_band and block.y0 >= footer_band.y0 - 2.0:
-            continue
-        result.append(block)
-
-    return result
-
-
-def detect_page_body_region(
-    page_blocks: list[PageBlock],
-    page_width: float,
-    page_height: float,
-) -> BodyRegion | None:
-    text_blocks = [b for b in page_blocks if _is_text_like(b)]
-    if not text_blocks:
-        return None
-
-    x0s = [b.x0 for b in text_blocks]
-    x1s = [b.x1 for b in text_blocks]
-    y0s = [b.y0 for b in text_blocks]
-    y1s = [b.y1 for b in text_blocks]
-
-    x0 = _clamp(_percentile(x0s, 0.15), 0.0, page_width)
-    x1 = _clamp(_percentile(x1s, 0.85), 0.0, page_width)
-    y0 = _clamp(_percentile(y0s, 0.15), 0.0, page_height)
-    y1 = _clamp(_percentile(y1s, 0.85), 0.0, page_height)
-
-    if x1 <= x0 or y1 <= y0:
-        return None
-
-    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
-
-
-def detect_page_body_regions(
-    blocks: list[PageBlock],
-    page_count: int,
-    page_width: float,
-    page_height: float,
-) -> list[BodyRegion | None]:
-    page_map = _group_by_page(blocks)
-    regions: list[BodyRegion | None] = []
-
-    for page_index in range(page_count):
-        page_blocks = page_map.get(page_index, [])
-        regions.append(detect_page_body_region(page_blocks, page_width, page_height))
-
-    return regions
-
-
-def detect_document_body_region_from_pages(
-    page_regions: list[BodyRegion | None],
-    page_width: float,
-    page_height: float,
-) -> BodyRegion | None:
-    valid = [r for r in page_regions if r is not None]
-    if not valid:
-        return None
-
-    x0 = _clamp(_percentile([r.x0 for r in valid], 0.15), 0.0, page_width)
-    x1 = _clamp(_percentile([r.x1 for r in valid], 0.85), 0.0, page_width)
-    y0 = _clamp(_percentile([r.y0 for r in valid], 0.15), 0.0, page_height)
-    y1 = _clamp(_percentile([r.y1 for r in valid], 0.85), 0.0, page_height)
-
-    if x1 <= x0 or y1 <= y0:
-        return None
-
-    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
-
-
-# -----------------------------------------------------------------------------
-# Marginalia
-# -----------------------------------------------------------------------------
-
-
-def detect_margin_zones(
-    blocks: list[PageBlock],
-    body: BodyRegion,
-    page_count: int,
-    page_width: float,
-) -> tuple[MarginZone | None, MarginZone | None]:
-    left_pages: set[int] = set()
-    right_pages: set[int] = set()
-    left_x0: list[float] = []
-    left_x1: list[float] = []
-    right_x0: list[float] = []
-    right_x1: list[float] = []
-
-    max_margin_width = page_width * 0.22
-
-    for block in blocks:
-        if not _is_text_like(block):
-            continue
-
-        if block.x1 <= body.x0 and block.width <= max_margin_width:
-            left_pages.add(block.page_index)
-            left_x0.append(block.x0)
-            left_x1.append(block.x1)
-
-        if block.x0 >= body.x1 and block.width <= max_margin_width:
-            right_pages.add(block.page_index)
-            right_x0.append(block.x0)
-            right_x1.append(block.x1)
-
-    left_zone = None
-    if left_pages and len(left_pages) / max(1, page_count) >= 0.10:
-        left_zone = MarginZone(
-            side="left",
-            x0=_percentile(left_x0, 0.10),
-            x1=_percentile(left_x1, 0.90),
-            coverage_ratio=len(left_pages) / page_count,
-            pages_present=len(left_pages),
-        )
-
-    right_zone = None
-    if right_pages and len(right_pages) / max(1, page_count) >= 0.10:
-        right_zone = MarginZone(
-            side="right",
-            x0=_percentile(right_x0, 0.10),
-            x1=_percentile(right_x1, 0.90),
-            coverage_ratio=len(right_pages) / page_count,
-            pages_present=len(right_pages),
-        )
-
-    return left_zone, right_zone
-
-
-def refine_page_body_region(
-    page_region: BodyRegion | None,
-    page_blocks: list[PageBlock],
-    left_margin_zone: MarginZone | None,
-    right_margin_zone: MarginZone | None,
-    page_width: float,
-    page_height: float,
-) -> BodyRegion | None:
-    if page_region is None:
-        return None
-
-    usable: list[PageBlock] = []
-
-    for block in page_blocks:
-        if not _is_text_like(block):
-            continue
-        if left_margin_zone and block.x1 <= left_margin_zone.x1:
-            continue
-        if right_margin_zone and block.x0 >= right_margin_zone.x0:
-            continue
-        usable.append(block)
-
-    if not usable:
-        return page_region
-
-    x0s = [b.x0 for b in usable]
-    x1s = [b.x1 for b in usable]
-    y0s = [b.y0 for b in usable]
-    y1s = [b.y1 for b in usable]
-
-    x0 = _clamp(_percentile(x0s, 0.15), 0.0, page_width)
-    x1 = _clamp(_percentile(x1s, 0.85), 0.0, page_width)
-    y0 = _clamp(_percentile(y0s, 0.15), 0.0, page_height)
-    y1 = _clamp(_percentile(y1s, 0.85), 0.0, page_height)
-
-    if x1 <= x0 or y1 <= y0:
-        return page_region
-
-    return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
-
-
-# -----------------------------------------------------------------------------
 # Column detection from lines
 # -----------------------------------------------------------------------------
 
@@ -979,7 +544,6 @@ def build_column_compatible_boxes(
 
         for box in boxes:
             if box.width > body_region.width * 0.75:
-                # breite Zeilen sind kein Spaltenkern
                 continue
 
             attached = False
@@ -1018,20 +582,11 @@ def split_line_boxes_by_page_role(
     line_boxes: list[ColumnBox],
     page_body_regions: list[BodyRegion | None],
     min_width_abs: float = 20.0,
-    wide_width_ratio: float = 0.72,
+    wide_width_ratio: float = 0.68,
 ) -> tuple[
     dict[int, list[tuple[float, float]]],
     dict[int, list[tuple[float, float]]],
 ]:
-    """
-    Trennt Textzeilen in:
-    - column candidate lines
-    - wide text lines
-
-    Rückgabe:
-        candidate_by_page, wide_by_page
-        jeweils {page_index: [(x0_rel, x1_rel), ...]}
-    """
     candidate_by_page: dict[int, list[tuple[float, float]]] = {}
     wide_by_page: dict[int, list[tuple[float, float]]] = {}
 
@@ -1067,10 +622,6 @@ def _cluster_positions_1d(
     tolerance: float = 0.06,
     min_cluster_size: int = 2,
 ) -> list[float]:
-    """
-    Einfache 1D-Clusterung für linke/rechte Kanten.
-    Rückgabe: Clusterzentren.
-    """
     if not values:
         return []
 
@@ -1098,15 +649,6 @@ def page_column_hypothesis(
     threshold_ratio: float = 0.25,
     min_lane_width_rel: float = 0.12,
 ) -> tuple[int, list[tuple[float, float]], float]:
-    """
-    Liefert:
-      (column_count, lane_ranges_rel, score)
-
-    Wichtig:
-    - basiert primär auf column candidate lines
-    - wide lines zerstören das Mehrspaltenmodell nicht
-    - kombiniert Occupancy + Cluster der linken Kanten
-    """
     wide_lines_rel = wide_lines_rel or []
 
     if not page_lines_rel:
@@ -1146,7 +688,6 @@ def page_column_hypothesis(
 
         i = j + 1
 
-    # Zusätzliche Stütze: Cluster der linken Kanten
     left_edges = [x0 for x0, _x1 in page_lines_rel]
     x0_clusters = _cluster_positions_1d(
         left_edges,
@@ -1159,30 +700,23 @@ def page_column_hypothesis(
 
     inferred_count = max(occupancy_count, cluster_count, 1)
 
-    # Schutz gegen Übersegmentierung
-    if inferred_count > 3:
-        inferred_count = 3
+    if inferred_count > 2:
+        inferred_count = 2
 
-    # Wenn occupancy nur 1 ergibt, aber die linken Kanten stabil 2 Cluster haben,
-    # ist das ein starkes Zweispaltensignal.
     if occupancy_count == 1 and cluster_count >= 2:
         inferred_count = 2
 
     widths = [x1 - x0 for x0, x1 in lanes] if lanes else []
-    wide_ratio = (
-        len(wide_lines_rel) / max(1, len(page_lines_rel) + len(wide_lines_rel))
-    )
+    wide_ratio = len(wide_lines_rel) / max(1, len(page_lines_rel) + len(wide_lines_rel))
 
     score = 0.0
     score += min(1.0, 0.35 * inferred_count)
     score += min(0.35, 0.35 * _mean(widths)) if widths else 0.0
     score += min(0.30, 0.15 * cluster_count)
-    score -= min(0.15, 0.10 * wide_ratio)  # viele breite Zeilen machen die Seite gemischter
+    score -= min(0.15, 0.10 * wide_ratio)
 
     score = max(0.0, min(1.0, score))
 
-    # Falls Cluster 2 sagen, aber Occupancy keine klaren Lanes trennt,
-    # bauen wir aus den Clusterzentren grobe Lanes.
     if inferred_count >= 2 and len(lanes) <= 1 and len(x0_clusters) >= 2:
         centers = sorted(x0_clusters[:inferred_count])
         synthetic: list[tuple[float, float]] = []
@@ -1223,6 +757,11 @@ def build_page_column_hypotheses(
             page_lines_rel=page_lines,
             wide_lines_rel=wide_lines,
         )
+
+        if page_index <= 1 and len(page_lines) < 12:
+            count = 1
+            lanes = []
+            score = min(score, 0.5)
 
         hypotheses.append(
             PageColumnHypothesis(
@@ -1304,7 +843,6 @@ def _relative_lane_intervals(
         if x1_rel <= x0_rel:
             continue
 
-        # nur echte column candidate boxes, keine breiten Zeilen
         if (x1_rel - x0_rel) >= 0.72:
             continue
 
@@ -1359,7 +897,7 @@ def _detect_lanes_from_intervals(
 
         x0_rel = i / bins
         x1_rel = (j + 1) / bins
-        pages_present = len(set().union(*pages_per_bin[i : j + 1]))
+        pages_present = len(set().union(*pages_per_bin[i:j + 1]))
         coverage_ratio = pages_present / eligible_pages
         lane_width = x1_rel - x0_rel
 
@@ -1558,15 +1096,26 @@ def build_page_layout_signatures(
     page_body_regions: list[BodyRegion | None],
     header_band: FurnitureBand | None,
     footer_band: FurnitureBand | None,
+    header_band_odd: FurnitureBand | None,
+    header_band_even: FurnitureBand | None,
+    footer_band_odd: FurnitureBand | None,
+    footer_band_even: FurnitureBand | None,
     column_boxes: list[ColumnBox],
     page_column_hypotheses: list[PageColumnHypothesis],
     page_count: int,
+    page_width: float,
+    page_height: float,
+    furniture_diag: dict[str, object] | None = None,
 ) -> list[PageLayoutSignature]:
     text_page_map = _group_by_page([b for b in blocks if _is_text_like(b)])
 
     box_page_map: dict[int, list[ColumnBox]] = {}
     for box in column_boxes:
         box_page_map.setdefault(box.page_index, []).append(box)
+
+    furniture_diag = furniture_diag or {}
+    header_quality = furniture_diag.get("header_quality")
+    footer_quality = furniture_diag.get("footer_quality")
 
     signatures: list[PageLayoutSignature] = []
 
@@ -1575,6 +1124,36 @@ def build_page_layout_signatures(
         page_boxes = box_page_map.get(page_index, [])
         page_body = page_body_regions[page_index]
         hyp = page_column_hypotheses[page_index]
+
+        header_band_for_page = header_band_odd if _is_odd_page(page_index) else header_band_even
+        if header_band_for_page is None:
+            header_band_for_page = header_band
+
+        footer_band_for_page = footer_band_odd if _is_odd_page(page_index) else footer_band_even
+        if footer_band_for_page is None:
+            footer_band_for_page = footer_band
+
+        page_has_header = decide_page_has_furniture(
+            page_blocks=page_blocks,
+            page_width=page_width,
+            page_height=page_height,
+            side="top",
+            page_count=page_count,
+            global_band=header_band_for_page,
+            global_quality=header_quality,
+            body_region=page_body,
+        )
+
+        page_has_footer = decide_page_has_furniture(
+            page_blocks=page_blocks,
+            page_width=page_width,
+            page_height=page_height,
+            side="bottom",
+            page_count=page_count,
+            global_band=footer_band_for_page,
+            global_quality=footer_quality,
+            body_region=page_body,
+        )
 
         active_lane_ranges_abs: list[tuple[float, float]] = []
         if page_body is not None:
@@ -1590,8 +1169,8 @@ def build_page_layout_signatures(
             page_index=page_index,
             page_number=page_index + 1,
             parity="odd" if _is_odd_page(page_index) else "even",
-            has_header=header_band is not None,
-            has_footer=footer_band is not None,
+            has_header=page_has_header,
+            has_footer=page_has_footer,
             body_x0=page_body.x0 if page_body else None,
             body_x1=page_body.x1 if page_body else None,
             body_y0=page_body.y0 if page_body else None,
@@ -1701,10 +1280,11 @@ def build_geometry_profile(pdf_path: Path) -> GeometryProfile:
     ) = detect_repeated_furniture_bands(
         blocks=blocks,
         page_count=page_count,
+        page_width=page_width,
         page_height=page_height,
     )
 
-    non_furniture_blocks = _filter_out_furniture(
+    non_furniture_blocks = filter_out_furniture(
         blocks=blocks,
         header_band=header_band,
         footer_band=footer_band,
@@ -1800,15 +1380,25 @@ def build_geometry_profile(pdf_path: Path) -> GeometryProfile:
             column_count = int(page_column_summary["dominant_column_count"])
         elif page_column_summary["has_secondary_two_column_mode"]:
             column_count = 2
+    column_count = max(1, min(2, column_count))
+
+    raw_text_blocks = [b for b in blocks if _is_text_like(b)]
 
     page_layout_signatures = build_page_layout_signatures(
-        blocks=non_furniture_blocks,
+        blocks=raw_text_blocks,
         page_body_regions=page_body_regions,
         header_band=header_band,
         footer_band=footer_band,
+        header_band_odd=header_band_odd,
+        header_band_even=header_band_even,
+        footer_band_odd=footer_band_odd,
+        footer_band_even=footer_band_even,
         column_boxes=column_boxes,
         page_column_hypotheses=page_column_hypotheses,
         page_count=page_count,
+        page_width=page_width,
+        page_height=page_height,
+        furniture_diag=furniture_diag,
     )
 
     layout_patterns = build_layout_patterns(

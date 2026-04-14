@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 
 from atlas.core.fuzzy import flinear, fdampen
 

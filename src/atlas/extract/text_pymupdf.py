@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 from atlas.db.connection import get_connection
 

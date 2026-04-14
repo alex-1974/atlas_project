@@ -6,6 +6,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+import logging
+import os
 
 from atlas.catalog.add import add_document
 from atlas.catalog.init import init_catalog
@@ -15,7 +17,13 @@ from atlas.db.connection import connect
 from atlas.db.migrate import assert_schema_current
 from atlas.parse import analyze_document
 from atlas.parse.config import ParseConfig
+from atlas.eval.geometry_eval import evaluate_geometry_against_ground_truth
 
+logging.basicConfig(
+    level=getattr(logging, os.getenv("PYTHONLOGLEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+    
 console = Console()
 app = typer.Typer(
     help="Atlas — lokales Werkzeug für PDF-Sammlungen",
@@ -973,6 +981,77 @@ def parse_document(
         for key, value in result.diagnostics.items():
             console.print(f"  {key}: {value}")
 
+
+@app.command("eval-geometry")
+def eval_geometry(
+    pdf_root: Path = typer.Option(..., "--pdf-root", help="Wurzelordner mit den PDFs"),
+    documents_csv: Path = typer.Option(
+        Path("evaluation/geometry_ground_truth/documents.csv"),
+        "--documents",
+        help="CSV mit document_id und filename",
+    ),
+    ground_truth_csv: Path = typer.Option(
+        Path("evaluation/geometry_ground_truth/layout_ground_truth.csv"),
+        "--ground-truth",
+        help="CSV mit seitenweiser Ground Truth",
+    ),
+    output_dir: Path = typer.Option(
+        Path("evaluation/geometry_results"),
+        "--output-dir",
+        help="Zielordner für predictions/errors/metrics",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Geometrieerkennung gegen eine Ground Truth evaluieren."""
+    documents_csv = documents_csv.resolve()
+    ground_truth_csv = ground_truth_csv.resolve()
+    pdf_root = pdf_root.resolve()
+    output_dir = output_dir.resolve()
+
+    if not pdf_root.exists() or not pdf_root.is_dir():
+        console.print(f"[red]Ungültiger PDF-Root:[/red] {pdf_root}")
+        raise typer.Exit(1)
+
+    if not documents_csv.exists():
+        console.print(f"[red]Nicht gefunden:[/red] {documents_csv}")
+        raise typer.Exit(1)
+
+    if not ground_truth_csv.exists():
+        console.print(f"[red]Nicht gefunden:[/red] {ground_truth_csv}")
+        raise typer.Exit(1)
+
+    with console.status("Evaluiere Geometrie…"):
+        metrics = evaluate_geometry_against_ground_truth(
+            pdf_root=pdf_root,
+            documents_csv=documents_csv,
+            layout_ground_truth_csv=ground_truth_csv,
+            output_dir=output_dir,
+        )
+
+    if as_json:
+        typer.echo(json.dumps(metrics, ensure_ascii=False, indent=2, default=str))
+        return
+
+    console.print("\n[bold]Geometry Evaluation[/bold]")
+    console.print(f"  Dokumente GT:        {metrics['documents_total_in_ground_truth']}")
+    console.print(f"  Dokumente evaluiert: {metrics['documents_evaluated']}")
+    console.print(f"  Seiten evaluiert:    {metrics['pages_evaluated']}")
+    console.print(f"  Column Accuracy:     {metrics['column_accuracy']:.3f}")
+
+    hm = metrics["header_metrics"]
+    fm = metrics["footer_metrics"]
+
+    console.print(
+        f"  Header P/R/F1:       {hm['precision']:.3f} / {hm['recall']:.3f} / {hm['f1']:.3f}"
+    )
+    console.print(
+        f"  Footer P/R/F1:       {fm['precision']:.3f} / {fm['recall']:.3f} / {fm['f1']:.3f}"
+    )
+
+    console.print("\n[bold]Artefakte[/bold]")
+    console.print(f"  predictions:         {metrics['artifacts']['predictions_csv']}")
+    console.print(f"  errors:              {metrics['artifacts']['errors_csv']}")
+    console.print(f"  metrics:             {metrics['artifacts']['metrics_json']}")
 
 if __name__ == "__main__":
     app()
