@@ -553,9 +553,21 @@ def _build_band_candidates_with_gaps(
         total_box_count = len(band_blocks)
 
         if side == "top":
-            if idx != 0:
-                continue
+            # Header-Kandidatenraum bewusst offen halten:
+            # Nicht nur das oberste Band zulassen, sondern mehrere plausible
+            # obere Bänder in die globale Statistik einspeisen.
+            #
+            # Begründung:
+            # - Wenn eine Seite keinen Running Header hat, ist das oberste Band
+            #   oft eine Kapitelüberschrift oder ein anderes Artefakt.
+            # - Für mittlere/lange Dokumente soll die dokumentweite Statistik
+            #   entscheiden, welches obere Band wirklich stabil und häufig ist.
+            # - Daher sammeln wir alle Bänder im oberen Randbereich, begrenzen
+            #   aber die Kandidatenzahl pro Seite auf die obersten zwei Bänder,
+            #   um den Kandidatenraum kontrolliert zu halten.
             if y1_rel > edge_ratio:
+                continue
+            if idx >= 2:
                 continue
 
             next_gap = 0.0
@@ -575,7 +587,13 @@ def _build_band_candidates_with_gaps(
                 ),
             )
 
-            score = (
+            # Die Seitenlokalbewertung bleibt bewusst moderat: Sie soll nur
+            # offensichtliche Unplausibilitäten abwerten, aber die endgültige
+            # Header-Entscheidung für mittlere/lange Dokumente der globalen
+            # Cluster-Statistik überlassen.
+            top_rank_bonus = 1.0 if idx == 0 else 0.92
+
+            score = top_rank_bonus * (
                 0.34 * gap_rel
                 + 0.34 * body_gap_rel
                 + 0.14 * (1.0 - min(height_rel / 0.08, 1.0))
