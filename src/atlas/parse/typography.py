@@ -107,6 +107,7 @@ def _normalize_font_family(font_name: str) -> str:
     # Stil-Suffix entfernen (-Bold, -Italic, -BoldOblique, etc.)
     for suffix in ('-Bold', '-Italic', '-BoldItalic', '-Oblique',
                    '-BoldOblique', '-Regular', '-Medium', '-Light',
+                   '-It', '-Bd', '-Rg',
                    ',Bold', ',Italic'):
         if name.endswith(suffix):
             name = name[:-len(suffix)]

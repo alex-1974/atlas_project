@@ -731,7 +731,7 @@ def detect_margin_zones(
             side="left",
             x0=_percentile(left_x0, 0.10),
             x1=_percentile(left_x1, 0.90),
-            coverage_ratio=len(left_pages) / page_count,
+            coverage_ratio=len(left_pages) / max(1, page_count),
             pages_present=len(left_pages),
         )
 
@@ -741,7 +741,7 @@ def detect_margin_zones(
             side="right",
             x0=_percentile(right_x0, 0.10),
             x1=_percentile(right_x1, 0.90),
-            coverage_ratio=len(right_pages) / page_count,
+            coverage_ratio=len(right_pages) / max(1, page_count),
             pages_present=len(right_pages),
         )
 
