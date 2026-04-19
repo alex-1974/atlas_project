@@ -20,6 +20,18 @@ from statistics import median
 from typing import NamedTuple
 
 from atlas.parse.logging import get_logger
+from ._utils import (
+    _clamp,
+    _is_odd_page,
+    _is_text_like,
+    _mad,
+    _mad_tolerance,
+    _median,
+    _middle_page_indexes,
+    _percentile,
+    _rect_intersection_area,
+)
+
 
 logger = get_logger(__name__)
 
@@ -137,33 +149,6 @@ class _Band(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
-def _median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return float(median(values))
-
-
-def _mad(values: list[float], med: float | None = None) -> float:
-    """Median Absolute Deviation."""
-    if not values:
-        return 0.0
-    m = med if med is not None else _median(values)
-    return _median([abs(v - m) for v in values])
-
-
-def _percentile(values: list[float], q: float) -> float:
-    if not values:
-        return 0.0
-    if len(values) == 1:
-        return values[0]
-    values = sorted(values)
-    pos = (len(values) - 1) * q
-    lo = int(pos)
-    hi = min(lo + 1, len(values) - 1)
-    frac = pos - lo
-    return values[lo] * (1.0 - frac) + values[hi] * frac
-
-
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
@@ -173,33 +158,11 @@ def _clamp(value: float, lower: float, upper: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _is_text_like(block: object) -> bool:
-    return (
-        getattr(block, "block_type", None) == 0
-        and bool(str(getattr(block, "text", "")).strip())
-    )
-
-
-def _is_odd_page(page_index: int) -> bool:
-    return (page_index + 1) % 2 == 1
-
-
 def _group_by_page(blocks: list[object]) -> dict[int, list[object]]:
     pages: dict[int, list[object]] = {}
     for block in blocks:
         pages.setdefault(block.page_index, []).append(block)
     return pages
-
-
-def _middle_page_indexes(page_count: int) -> list[int]:
-    """Mittleres Drittel des Dokuments."""
-    if page_count <= 6:
-        return list(range(page_count))
-    start = max(0, page_count // 3)
-    end = min(page_count, (2 * page_count) // 3)
-    if end <= start:
-        return list(range(page_count))
-    return list(range(start, end))
 
 
 # ---------------------------------------------------------------------------
@@ -264,18 +227,6 @@ def _footer_candidate(bands: list[_Band]) -> _Band | None:
 # ---------------------------------------------------------------------------
 # Aggregation über Seiten: Median + MAD
 # ---------------------------------------------------------------------------
-
-
-def _mad_tolerance(values: list[float], page_height: float, factor: float = 2.0) -> float:
-    """
-    MAD-basierte Kohärenz-Schwelle.
-    Minimum: page_height × 0.005 — verhindert Kollaps bei sehr stabilen Dokumenten.
-    """
-    if not values:
-        return page_height * 0.005
-    med = _median(values)
-    mad = _mad(values, med)
-    return max(mad * factor, page_height * 0.005)
 
 
 def _cluster_band_candidates(
@@ -653,7 +604,6 @@ def infer_furniture_profile(
 # ---------------------------------------------------------------------------
 
 
-
 def match_page_to_furniture_profile(
     profile: FurnitureProfile,
     observation: PageFurnitureObservation,
@@ -684,8 +634,6 @@ def match_page_to_furniture_profile(
 # ---------------------------------------------------------------------------
 # Öffentliche API: decide_page_has_furniture (Wrapper für geometry.py)
 # ---------------------------------------------------------------------------
-
-
 
 
 def detect_page_body_region(
@@ -837,7 +785,6 @@ def refine_page_body_region(
     return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
 
 
-
 def _merge_bands(
     bands: list[FurnitureBand | None],
     side: str,
@@ -854,19 +801,6 @@ def _merge_bands(
         pages_present=max(b.pages_present for b in valid),
         page_parity="all",
     )
-
-
-def _rect_intersection_area(
-    a: tuple[float, float, float, float],
-    b: tuple[float, float, float, float],
-) -> float:
-    x0 = max(a[0], b[0])
-    y0 = max(a[1], b[1])
-    x1 = min(a[2], b[2])
-    y1 = min(a[3], b[3])
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-    return (x1 - x0) * (y1 - y0)
 
 
 def filter_text_blocks_overlapping_images(

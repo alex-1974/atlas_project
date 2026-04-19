@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pymupdf as fitz
@@ -153,6 +154,5 @@ class ParsePipeline:
         return sum(ch.isalpha() for ch in value) >= 4
 
     def _extract_year(self, date_string: str) -> str | None:
-        import re
         match = re.search(r"(19|20)\d{2}", date_string)
         return match.group(0) if match else None
