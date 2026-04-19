@@ -528,7 +528,7 @@ def infer_furniture_profile(
     Analyse-Seiten: mittleres Drittel des Dokuments (oder profile_page_indexes).
     Parity: odd/even separat, dann zusammengeführt falls kein Unterschied.
     """
-    filtered_blocks = _filter_image_overlaps(blocks, page_image_rects)
+    filtered_blocks = filter_text_blocks_overlapping_images(blocks, page_image_rects)
     text_blocks = [b for b in filtered_blocks if _is_text_like(b)]
     page_map = _group_by_page(text_blocks)
 
@@ -653,52 +653,6 @@ def infer_furniture_profile(
 # ---------------------------------------------------------------------------
 
 
-def detect_repeated_furniture_bands(
-    blocks: list[object],
-    page_count: int,
-    page_width: float,
-    page_height: float,
-    profile_page_indexes: list[int] | None = None,
-) -> tuple[
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    FurnitureBand | None,
-    dict[str, object],
-]:
-    """
-    Kompatibilitäts-Wrapper für geometry.py.
-    Delegiert an infer_furniture_profile.
-    """
-    profile, _ = infer_furniture_profile(
-        blocks=blocks,
-        page_count=page_count,
-        page_width=page_width,
-        page_height=page_height,
-        profile_page_indexes=profile_page_indexes,
-    )
-
-    diag = dict(profile.diagnostics)
-    diag["header_quality"] = profile.header_presence_ratio
-    diag["footer_quality"] = profile.footer_presence_ratio
-
-    return (
-        profile.header_band,
-        profile.footer_band,
-        profile.header_band_odd,
-        profile.header_band_even,
-        profile.footer_band_odd,
-        profile.footer_band_even,
-        diag,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Öffentliche API: match_page_to_furniture_profile
-# ---------------------------------------------------------------------------
-
 
 def match_page_to_furniture_profile(
     profile: FurnitureProfile,
@@ -732,51 +686,6 @@ def match_page_to_furniture_profile(
 # ---------------------------------------------------------------------------
 
 
-def decide_page_has_furniture(
-    page_blocks: list[object],
-    page_width: float,
-    page_height: float,
-    side: str,
-    page_count: int,
-    global_band: FurnitureBand | None = None,
-    global_quality: float | None = None,
-    body_region: BodyRegion | None = None,
-) -> bool:
-    """
-    Wrapper für geometry.py-Kompatibilität.
-    Delegiert an _page_has_furniture.
-    """
-    return _page_has_furniture(page_blocks, page_height, side, global_band)
-
-
-# ---------------------------------------------------------------------------
-# Body-Region und Margin-Zonen (unverändert — keine Heuristik-Änderung)
-# ---------------------------------------------------------------------------
-
-
-def filter_out_furniture(
-    blocks: list[object],
-    header_band: FurnitureBand | None,
-    footer_band: FurnitureBand | None,
-) -> list[object]:
-    """
-    Entfernt Blöcke, die im Header- oder Footer-Band liegen.
-    Toleranz: 1% der Bandgröße — relativ statt 2pt fest.
-    """
-    result: list[object] = []
-    for block in blocks:
-        if not _is_text_like(block):
-            continue
-        if header_band:
-            tol = header_band.height * 0.10 + 1.0
-            if float(block.y1) <= header_band.y1 + tol:
-                continue
-        if footer_band:
-            tol = footer_band.height * 0.10 + 1.0
-            if float(block.y0) >= footer_band.y0 - tol:
-                continue
-        result.append(block)
-    return result
 
 
 def detect_page_body_region(
@@ -928,22 +837,6 @@ def refine_page_body_region(
     return BodyRegion(x0=x0, y0=y0, x1=x1, y1=y1)
 
 
-def page_matches_band_candidate(
-    page_blocks: list[object],
-    page_width: float,
-    page_height: float,
-    side: str,
-    band: FurnitureBand | None,
-    tolerance_ratio: float = 0.02,
-) -> bool:
-    """Wrapper für geometry.py-Kompatibilität."""
-    return _page_has_furniture(page_blocks, page_height, side, band)
-
-
-# ---------------------------------------------------------------------------
-# Hilfsfunktionen (intern)
-# ---------------------------------------------------------------------------
-
 
 def _merge_bands(
     bands: list[FurnitureBand | None],
@@ -976,7 +869,7 @@ def _rect_intersection_area(
     return (x1 - x0) * (y1 - y0)
 
 
-def _filter_image_overlaps(
+def filter_text_blocks_overlapping_images(
     blocks: list[object],
     page_image_rects: dict[int, list[tuple[float, float, float, float]]] | None,
     overlap_threshold: float = 0.50,
@@ -1003,5 +896,3 @@ def _filter_image_overlaps(
     return filtered
 
 
-# Alias für filter_text_blocks_overlapping_images (geometry.py-Kompatibilität)
-filter_text_blocks_overlapping_images = _filter_image_overlaps

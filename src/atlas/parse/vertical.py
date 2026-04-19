@@ -986,37 +986,3 @@ def match_page_to_vertical_profile(
 # ---------------------------------------------------------------------------
 # Kompatibilitäts-Wrapper für geometry.py
 # ---------------------------------------------------------------------------
-
-
-def detect_column_lanes(
-    pdf_path: Path,
-    page_body_regions: list[BodyRegion | None],
-    page_count: int,
-    document_body_region: BodyRegion,
-    page_image_rects: dict[int, list[tuple[float, float, float, float]]] | None = None,
-    profile_page_indexes: list[int] | None = None,
-) -> tuple[int, list[float], float | None, list[ColumnLane], list[object], dict[str, object]]:
-    """Wrapper für geometry.py-Kompatibilität."""
-    profile, _observations, column_boxes = infer_vertical_profile(
-        pdf_path=pdf_path,
-        page_body_regions=page_body_regions,
-        page_count=page_count,
-        document_body_region=document_body_region,
-        page_image_rects=page_image_rects,
-        profile_page_indexes=profile_page_indexes,
-    )
-
-    widths = (
-        [lane.width for lane in profile.dominant_column_lanes]
-        if profile.dominant_column_lanes
-        else [document_body_region.width]
-    )
-
-    return (
-        profile.dominant_column_count,
-        widths,
-        profile.dominant_gap,
-        profile.dominant_column_lanes,
-        column_boxes,
-        profile.diagnostics,
-    )
