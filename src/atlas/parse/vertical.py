@@ -1,51 +1,49 @@
+"""
+atlas.parse.vertical
+
+Spaltenerkennung und Marginalienerkennung.
+
+Kernidee:
+    Textblöcke einer Seite liefern (x0, x1)-Paare. y wird kollabiert —
+    nur die horizontale Lage zählt. Über die Mittelseiten des Dokuments
+    werden x0-Werte geclustert; innerhalb jedes Clusters bestimmt der
+    Median von x1 die Spaltenbreite. Statistisch häufige schmale Cluster
+    sind Spalten, seltene Randcluster mit wenig Blöcken sind Marginalien.
+
+Kein expliziter Breitenfilter, keine hartcodierten Schwellen.
+Median und MAD skalieren von selbst.
+"""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import median
 
-import pymupdf as fitz  # PyMuPDF
+import pymupdf as fitz
 
 from .zones import BodyRegion
 
+from atlas.parse.logging import get_logger
 
-@dataclass(slots=True)
-class ColumnBox:
-    """
-    Seitenlokale, spaltenkompatible Box auf Basis einzelner Textzeilen.
-    """
+logger = get_logger(__name__)
 
-    page_index: int
-    parity: str  # "odd" | "even"
-    x0: float
-    y0: float
-    x1: float
-    y1: float
 
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x1 - self.x0)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y1 - self.y0)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+# ---------------------------------------------------------------------------
+# Datenmodelle
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class ColumnLane:
-    """
-    Dokumentweit dominante vertikale Textbahn.
-    """
-
+    """Dokumentweit dominante vertikale Textbahn."""
     index: int
     x0: float
     x1: float
     pages_present: int
     coverage_ratio: float
     block_count: int
+    is_marginalia: bool = False
 
     @property
     def width(self) -> float:
@@ -56,51 +54,63 @@ class ColumnLane:
 
 
 @dataclass(slots=True)
-class PageColumnHypothesis:
-    """
-    Seitenweise Hypothese über die Zahl und Lage von Spalten.
-    """
-
-    page_index: int
-    column_count: int
-    lane_ranges_rel: list[tuple[float, float]]
-    score: float
-    candidate_line_count: int = 0
-    wide_line_count: int = 0
+class VerticalProfile:
+    page_count: int
+    profile_pages: list[int]
+    dominant_column_count: int
+    dominant_column_lanes: list[ColumnLane]
+    dominant_gap: float | None
+    marginalia_candidates: list[ColumnLane] = field(default_factory=list)
+    confidence: float = 0.0
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 @dataclass(slots=True)
-class VerticalCandidate:
-    """
-    Seitenlokaler vertikaler Kandidat innerhalb des Body.
-
-    Anders als bei Header/Footer ist hier nicht nur die x-Lage wichtig,
-    sondern auch die robuste vertikale Ausdehnung. Genau darüber trennen
-    wir Spalten von Marginalien.
-    """
-
+class PageVerticalObservation:
     page_index: int
     parity: str
-    x0_rel: float
-    x1_rel: float
-    y0_rel: float
-    y1_rel: float
-    width_rel: float
-    height_rel: float
-    coverage_rel: float
-    block_count: int
+    observed_column_count: int
+    observed_lane_ranges: list[tuple[float, float]]
+    score: float
+    candidate_line_count: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class VerticalMatch:
+    page_index: int
+    column_match: bool
+    observed_column_count: int
+    expected_column_count: int
+    matched_lane_indices: list[int]
+    deviation_score: float
+    deviation_types: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Statistische Hilfsfunktionen
+# ---------------------------------------------------------------------------
 
 
 def _median(values: list[float]) -> float:
     if not values:
         return 0.0
     return float(median(values))
+
+
+def _mad(values: list[float], med: float | None = None) -> float:
+    if not values:
+        return 0.0
+    m = med if med is not None else _median(values)
+    return _median([abs(v - m) for v in values])
 
 
 def _percentile(values: list[float], q: float) -> float:
@@ -122,683 +132,567 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
-def _smooth(values: list[float], window: int = 5) -> list[float]:
-    if not values or window <= 1:
-        return values[:]
-    radius = window // 2
-    result: list[float] = []
-    for i in range(len(values)):
-        lo = max(0, i - radius)
-        hi = min(len(values), i + radius + 1)
-        result.append(_mean(values[lo:hi]))
-    return result
+def _mad_tolerance(values: list[float], body_width: float, factor: float = 2.0) -> float:
+    """MAD-basierte Kohärenz-Schwelle. Minimum: body_width × 0.01."""
+    if not values:
+        return body_width * 0.01
+    med = _median(values)
+    mad = _mad(values, med)
+    return max(mad * factor, body_width * 0.01)
 
 
 def _is_odd_page(page_index: int) -> bool:
     return (page_index + 1) % 2 == 1
 
 
-def extract_text_line_boxes(
+def _middle_page_indexes(page_count: int) -> list[int]:
+    if page_count <= 6:
+        return list(range(page_count))
+    start = max(0, page_count // 3)
+    end = min(page_count, (2 * page_count) // 3)
+    if end <= start:
+        return list(range(page_count))
+    return list(range(start, end))
+
+
+# ---------------------------------------------------------------------------
+# Block-Extraktion
+# ---------------------------------------------------------------------------
+
+
+def _is_text_like(block: object) -> bool:
+    return (
+        getattr(block, "block_type", None) == 0
+        and bool(str(getattr(block, "text", "")).strip())
+    )
+
+
+def _rect_intersection_area(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def extract_blocks_in_body(
     pdf_path: Path,
     page_body_regions: list[BodyRegion | None],
-) -> list[ColumnBox]:
+    page_image_rects: dict[int, list[tuple[float, float, float, float]]] | None = None,
+) -> dict[int, list[tuple[float, float]]]:
     """
-    Extrahiert horizontale Textzeilen im jeweiligen Seiten-Body.
+    Extrahiert (x0, x1)-Paare aller Textblöcke innerhalb der Body-Region.
 
-    Wichtig:
-    - Nur Text aus page.get_text("dict")
-    - Keine Bilder / drawings / image blocks
+    y wird kollabiert — nur die horizontale Lage ist relevant.
+    Blöcke, die stark mit Bildflächen überlappen, werden übersprungen.
+
+    Gibt ein Dict {page_index: [(x0, x1), ...]} zurück.
     """
-    boxes: list[ColumnBox] = []
+    result: dict[int, list[tuple[float, float]]] = {}
 
     with fitz.open(pdf_path) as doc:
         for page_index in range(len(doc)):
-            body_region = page_body_regions[page_index]
-            if body_region is None:
+            body = page_body_regions[page_index]
+            if body is None:
                 continue
 
             page = doc.load_page(page_index)
-            clip = fitz.Rect(
-                body_region.x0,
-                body_region.y0,
-                body_region.x1,
-                body_region.y1,
-            )
+            clip = fitz.Rect(body.x0, body.y0, body.x1, body.y1)
+            raw_blocks = page.get_text("blocks", clip=clip)
 
-            data = page.get_text(
-                "dict",
-                flags=fitz.TEXTFLAGS_TEXT,
-                clip=clip,
-            )
+            image_rects = (page_image_rects or {}).get(page_index, [])
+            pairs: list[tuple[float, float]] = []
 
-            parity = "odd" if _is_odd_page(page_index) else "even"
-
-            for block in data.get("blocks", []):
-                if "lines" not in block:
+            for raw in raw_blocks:
+                x0, y0, x1, y1, text, _block_no, block_type = raw[:7]
+                if block_type != 0:
+                    continue
+                if not str(text).strip():
+                    continue
+                if x1 <= x0:
                     continue
 
-                for line in block["lines"]:
-                    if tuple(line.get("dir", (1, 0))) != (1, 0):
-                        continue
-
-                    bbox = line.get("bbox")
-                    if not bbox:
-                        continue
-
-                    x0, y0, x1, y1 = map(float, bbox)
-                    if x1 <= x0 or y1 <= y0:
-                        continue
-
-                    text = "".join(
-                        span.get("text", "").strip()
-                        for span in line.get("spans", [])
-                    ).strip()
-                    if len(text) < 2:
-                        continue
-
-                    boxes.append(
-                        ColumnBox(
-                            page_index=page_index,
-                            parity=parity,
-                            x0=x0,
-                            y0=y0,
-                            x1=x1,
-                            y1=y1,
+                # Bild-Überlappung prüfen
+                if image_rects:
+                    block_rect = (float(x0), float(y0), float(x1), float(y1))
+                    block_area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+                    if block_area > 0:
+                        max_ratio = max(
+                            (_rect_intersection_area(block_rect, ir) / block_area
+                             for ir in image_rects),
+                            default=0.0,
                         )
-                    )
+                        if max_ratio >= 0.50:
+                            continue
 
-    return boxes
+                pairs.append((float(x0), float(x1)))
 
-
-def build_column_compatible_boxes(
-    line_boxes: list[ColumnBox],
-    page_body_regions: list[BodyRegion | None],
-) -> list[ColumnBox]:
-    """
-    Verschmilzt zeilenweise Boxen seitenlokal zu vertikal kompatiblen Boxen.
-
-    Ziel:
-    - seitenlokale vertikale Bahnen aufbauen
-    - breite Volltextzeilen nicht blind als Lane-Signal dominieren lassen
-    """
-    page_map: dict[int, list[ColumnBox]] = {}
-    for box in line_boxes:
-        page_map.setdefault(box.page_index, []).append(box)
-
-    merged_all: list[ColumnBox] = []
-
-    for page_index, boxes in page_map.items():
-        body_region = page_body_regions[page_index]
-        if body_region is None:
-            continue
-
-        boxes = sorted(boxes, key=lambda b: (b.x0, b.y0))
-        merged: list[ColumnBox] = []
-
-        for box in boxes:
-            if box.width > body_region.width * 0.90:
-                continue
-
-            attached = False
-
-            for i, existing in enumerate(merged):
-                overlap = min(existing.x1, box.x1) - max(existing.x0, box.x0)
-                min_width = max(1.0, min(existing.width, box.width))
-                overlap_ratio = max(0.0, overlap) / min_width if min_width > 0 else 0.0
-
-                x_center_delta = abs(
-                    ((existing.x0 + existing.x1) / 2.0)
-                    - ((box.x0 + box.x1) / 2.0)
-                )
-
-                same_lane = (
-                    overlap_ratio >= 0.45
-                    or x_center_delta <= max(existing.width, box.width) * 0.18
-                )
-                vertically_reachable = (
-                    box.y0 <= existing.y1 + max(existing.height, box.height) * 3.0
-                )
-
-                if same_lane and vertically_reachable:
-                    merged[i] = ColumnBox(
-                        page_index=existing.page_index,
-                        parity=existing.parity,
-                        x0=min(existing.x0, box.x0),
-                        y0=min(existing.y0, box.y0),
-                        x1=max(existing.x1, box.x1),
-                        y1=max(existing.y1, box.y1),
-                    )
-                    attached = True
-                    break
-
-            if not attached:
-                merged.append(box)
-
-        merged_all.extend(merged)
-
-    return merged_all
-
-
-def _build_page_vertical_candidates_map(
-    column_boxes: list[ColumnBox],
-    page_body_regions: list[BodyRegion | None],
-) -> dict[int, list[VerticalCandidate]]:
-    """
-    Baut seitenlokale vertikale Kandidaten im Body.
-
-    Idee:
-    - x-ähnliche Boxen pro Seite gruppieren
-    - deren vertikale Ausdehnung bestimmen
-    - niedrige/kurze Bahnen später statistisch als Marginalien aussortieren
-    """
-    page_map: dict[int, list[ColumnBox]] = {}
-    for box in column_boxes:
-        page_map.setdefault(box.page_index, []).append(box)
-
-    result: dict[int, list[VerticalCandidate]] = {}
-
-    for page_index, boxes in page_map.items():
-        body = page_body_regions[page_index]
-        if body is None or body.width <= 0 or body.height <= 0:
-            continue
-
-        filtered = [
-            b for b in boxes
-            if b.width >= body.width * 0.08
-            and b.height >= body.height * 0.04
-        ]
-        if not filtered:
-            continue
-
-        filtered = sorted(filtered, key=lambda b: (b.x0, b.y0))
-        groups: list[list[ColumnBox]] = []
-
-        for box in filtered:
-            attached = False
-
-            for group in groups:
-                gx0 = min(b.x0 for b in group)
-                gx1 = max(b.x1 for b in group)
-                g_center = (gx0 + gx1) / 2.0
-                box_center = (box.x0 + box.x1) / 2.0
-
-                overlap = min(gx1, box.x1) - max(gx0, box.x0)
-                min_width = max(1.0, min(gx1 - gx0, box.width))
-                overlap_ratio = max(0.0, overlap) / min_width
-                center_delta = abs(g_center - box_center)
-
-                if overlap_ratio >= 0.35 or center_delta <= body.width * 0.08:
-                    group.append(box)
-                    attached = True
-                    break
-
-            if not attached:
-                groups.append([box])
-
-        candidates: list[VerticalCandidate] = []
-
-        for group in groups:
-            x0 = min(b.x0 for b in group)
-            x1 = max(b.x1 for b in group)
-            y0 = min(b.y0 for b in group)
-            y1 = max(b.y1 for b in group)
-
-            width_rel = (x1 - x0) / body.width
-            height_rel = (y1 - y0) / body.height
-
-            if width_rel < 0.08:
-                continue
-            if height_rel < 0.12:
-                continue
-
-            x0_rel = (x0 - body.x0) / body.width
-            x1_rel = (x1 - body.x0) / body.width
-            y0_rel = (y0 - body.y0) / body.height
-            y1_rel = (y1 - body.y0) / body.height
-
-            x0_rel = max(0.0, min(1.0, x0_rel))
-            x1_rel = max(0.0, min(1.0, x1_rel))
-            y0_rel = max(0.0, min(1.0, y0_rel))
-            y1_rel = max(0.0, min(1.0, y1_rel))
-
-            candidates.append(
-                VerticalCandidate(
-                    page_index=page_index,
-                    parity="odd" if _is_odd_page(page_index) else "even",
-                    x0_rel=x0_rel,
-                    x1_rel=x1_rel,
-                    y0_rel=y0_rel,
-                    y1_rel=y1_rel,
-                    width_rel=width_rel,
-                    height_rel=height_rel,
-                    coverage_rel=height_rel,
-                    block_count=len(group),
-                )
-            )
-
-        candidates.sort(key=lambda c: (-c.coverage_rel, c.x0_rel))
-        result[page_index] = candidates[:4]
+            if pairs:
+                result[page_index] = pairs
 
     return result
 
 
-def _cluster_positions_1d(
+# ---------------------------------------------------------------------------
+# Kern: Breiten-basiertes Clustering mit anschließendem x0-Clustering
+# ---------------------------------------------------------------------------
+
+
+def _histogram_peaks(
     values: list[float],
-    tolerance: float = 0.06,
-    min_cluster_size: int = 2,
-) -> list[float]:
+    span_width: float,
+    threshold_ratio: float = 0.15,
+    min_gap_pt: float = 10.0,
+) -> list[tuple[float, float]]:
+    """
+    Findet Peaks in einer Werteverteilung via Histogramm.
+
+    Gibt eine Liste von (lo, hi)-Intervallen zurück, je einen pro Peak.
+    Peaks mit einem Gap < min_gap_pt werden zusammengeführt.
+    """
     if not values:
         return []
 
-    values = sorted(values)
-    clusters: list[list[float]] = [[values[0]]]
+    bin_count = max(60, int(span_width / 5.0))
+    v_min = min(values)
+    v_max = max(values)
+    v_span = max(v_max - v_min, 1.0)
 
-    for value in values[1:]:
-        if abs(value - clusters[-1][-1]) <= tolerance:
-            clusters[-1].append(value)
-        else:
-            clusters.append([value])
+    counts = [0] * bin_count
+    for v in values:
+        idx = int((v - v_min) / v_span * (bin_count - 1))
+        counts[max(0, min(bin_count - 1, idx))] += 1
 
-    return [
-        _median(cluster)
-        for cluster in clusters
-        if len(cluster) >= min_cluster_size
-    ]
+    max_count = max(counts)
+    threshold = max_count * threshold_ratio
+    active = [c >= threshold for c in counts]
 
-
-def _page_occupancy_hypothesis(
-    page_lines_rel: list[tuple[float, float]],
-    wide_lines_rel: list[tuple[float, float]] | None = None,
-    bins: int = 80,
-    threshold_ratio: float = 0.25,
-    min_lane_width_rel: float = 0.12,
-) -> tuple[int, list[tuple[float, float]], float]:
-    """
-    Frühere Occupancy-Idee als Hilfssignal:
-    kollabieren über y und suchen Häufungen nach x.
-    """
-    wide_lines_rel = wide_lines_rel or []
-
-    if not page_lines_rel:
-        return 0, [], 0.0
-
-    occupied = [0] * bins
-
-    for x0_rel, x1_rel in page_lines_rel:
-        start = max(0, min(bins - 1, int(x0_rel * bins)))
-        end = max(0, min(bins - 1, int(x1_rel * bins)))
-        for i in range(start, end + 1):
-            occupied[i] += 1
-
-    max_occ = max(occupied) if occupied else 0
-    if max_occ == 0:
-        return 0, [], 0.0
-
-    threshold = max_occ * threshold_ratio
-    occ = _smooth([float(v) for v in occupied], window=5)
-
-    lanes: list[tuple[float, float]] = []
+    raw_peaks: list[tuple[int, int]] = []
     i = 0
-    while i < bins:
-        if occ[i] < threshold:
+    while i < bin_count:
+        if not active[i]:
             i += 1
             continue
-
         j = i
-        while j + 1 < bins and occ[j + 1] >= threshold:
+        while j + 1 < bin_count and active[j + 1]:
             j += 1
-
-        x0_rel = i / bins
-        x1_rel = (j + 1) / bins
-
-        if (x1_rel - x0_rel) >= min_lane_width_rel:
-            lanes.append((x0_rel, x1_rel))
-
+        raw_peaks.append((i, j))
         i = j + 1
 
-    left_edges = [x0 for x0, _x1 in page_lines_rel]
-    x0_clusters = _cluster_positions_1d(
-        left_edges,
-        tolerance=0.06,
-        min_cluster_size=max(2, int(len(left_edges) * 0.15)),
-    )
-
-    occupancy_count = len(lanes)
-    cluster_count = len(x0_clusters)
-    inferred_count = max(occupancy_count, cluster_count, 1)
-
-    if inferred_count > 2:
-        inferred_count = 2
-
-    if occupancy_count == 1 and cluster_count >= 2:
-        inferred_count = 2
-
-    widths = [x1 - x0 for x0, x1 in lanes] if lanes else []
-    wide_ratio = len(wide_lines_rel) / max(1, len(page_lines_rel) + len(wide_lines_rel))
-
-    score = 0.0
-    score += min(1.0, 0.35 * inferred_count)
-    score += min(0.35, 0.35 * _mean(widths)) if widths else 0.0
-    score += min(0.30, 0.15 * cluster_count)
-    score -= min(0.15, 0.10 * wide_ratio)
-    score = max(0.0, min(1.0, score))
-
-    return inferred_count, lanes, score
-
-
-def build_page_column_hypotheses(
-    line_boxes: list[ColumnBox],
-    page_body_regions: list[BodyRegion | None],
-    page_count: int,
-) -> list[PageColumnHypothesis]:
-    """
-    Seitenweise Hypothese auf Basis eines Hybridmodells:
-
-    1. Vertikale Kandidaten (Spalten höher als Marginalien)
-    2. Occupancy über x als Stabilisierungssignal
-    """
-    column_boxes = build_column_compatible_boxes(
-        line_boxes=line_boxes,
-        page_body_regions=page_body_regions,
-    )
-    candidate_map = _build_page_vertical_candidates_map(
-        column_boxes=column_boxes,
-        page_body_regions=page_body_regions,
-    )
-
-    wide_line_count_by_page: dict[int, int] = {}
-    line_count_by_page: dict[int, int] = {}
-    occupancy_lines_by_page: dict[int, list[tuple[float, float]]] = {}
-    wide_occupancy_lines_by_page: dict[int, list[tuple[float, float]]] = {}
-
-    for box in line_boxes:
-        line_count_by_page[box.page_index] = line_count_by_page.get(box.page_index, 0) + 1
-        body = page_body_regions[box.page_index]
-        if body is None or body.width <= 0:
-            continue
-
-        x0_rel = (box.x0 - body.x0) / body.width
-        x1_rel = (box.x1 - body.x0) / body.width
-        x0_rel = max(0.0, min(1.0, x0_rel))
-        x1_rel = max(0.0, min(1.0, x1_rel))
-        if x1_rel <= x0_rel:
-            continue
-
-        width_rel = x1_rel - x0_rel
-        if width_rel >= 0.68:
-            wide_line_count_by_page[box.page_index] = (
-                wide_line_count_by_page.get(box.page_index, 0) + 1
-            )
-            wide_occupancy_lines_by_page.setdefault(box.page_index, []).append((x0_rel, x1_rel))
-        elif width_rel >= 0.04:
-            occupancy_lines_by_page.setdefault(box.page_index, []).append((x0_rel, x1_rel))
-
-    hypotheses: list[PageColumnHypothesis] = []
-
-    for page_index in range(page_count):
-        candidates = candidate_map.get(page_index, [])
-        tall = [c for c in candidates if c.coverage_rel >= 0.45]
-        very_tall = [c for c in candidates if c.coverage_rel >= 0.62]
-
-        if len(very_tall) >= 2:
-            vertical_selected = sorted(very_tall, key=lambda c: c.x0_rel)[:2]
-        elif len(tall) >= 2:
-            vertical_selected = sorted(tall, key=lambda c: c.x0_rel)[:2]
-        elif tall:
-            vertical_selected = [max(tall, key=lambda c: c.coverage_rel)]
-        elif candidates:
-            vertical_selected = [max(candidates, key=lambda c: c.coverage_rel)]
+    # Kleine Gaps schließen
+    min_gap_bins = max(2, int(min_gap_pt / (v_span / bin_count)))
+    merged: list[tuple[int, int]] = []
+    for peak in raw_peaks:
+        if merged and (peak[0] - merged[-1][1]) <= min_gap_bins:
+            merged[-1] = (merged[-1][0], peak[1])
         else:
-            vertical_selected = []
+            merged.append(peak)
 
-        occ_count, occ_lanes, occ_score = _page_occupancy_hypothesis(
-            occupancy_lines_by_page.get(page_index, []),
-            wide_occupancy_lines_by_page.get(page_index, []),
-        )
+    result: list[tuple[float, float]] = []
+    for start, end in merged:
+        lo = v_min + (start / bin_count) * v_span - 3.0
+        hi = v_min + ((end + 1) / bin_count) * v_span + 3.0
+        result.append((lo, hi))
 
-        vertical_count = len(vertical_selected)
-        vertical_lanes = [(c.x0_rel, c.x1_rel) for c in vertical_selected]
-
-        if vertical_count == 0 and occ_count > 0:
-            final_count = occ_count
-            final_lanes = occ_lanes[:2]
-        elif vertical_count > 0 and occ_count == 0:
-            final_count = vertical_count
-            final_lanes = vertical_lanes[:2]
-        elif vertical_count > 0 and occ_count > 0:
-            if occ_count > vertical_count and occ_score >= 0.45:
-                final_count = occ_count
-                final_lanes = occ_lanes[:2]
-            else:
-                final_count = vertical_count
-                final_lanes = vertical_lanes[:2]
-        else:
-            final_count = 0
-            final_lanes = []
-
-        if page_index <= 1 and line_count_by_page.get(page_index, 0) < 12 and final_count > 1:
-            final_count = 1
-            final_lanes = final_lanes[:1]
-
-        score = 0.0
-        if vertical_selected:
-            score += min(0.65, 0.25 * len(vertical_selected) + 0.40 * _mean([c.coverage_rel for c in vertical_selected]))
-            score += min(0.15, 0.04 * _mean([c.block_count for c in vertical_selected]))
-        score += min(0.20, 0.20 * occ_score)
-        score = max(0.0, min(1.0, score))
-
-        hypotheses.append(
-            PageColumnHypothesis(
-                page_index=page_index,
-                column_count=final_count,
-                lane_ranges_rel=final_lanes,
-                score=score,
-                candidate_line_count=line_count_by_page.get(page_index, 0),
-                wide_line_count=wide_line_count_by_page.get(page_index, 0),
-            )
-        )
-
-    return hypotheses
+    return result
 
 
-def summarize_page_column_hypotheses(
-    hypotheses: list[PageColumnHypothesis],
-    page_count: int,
-) -> dict[str, object]:
-    nonzero = [h for h in hypotheses if h.column_count > 0]
-    if not nonzero:
-        return {
-            "dominant_column_count": 0,
-            "coverage_by_count": {},
-            "mean_score": 0.0,
-            "has_secondary_two_column_mode": False,
-            "two_column_coverage": 0.0,
-            "mixed_layout": False,
-        }
+def _find_column_width(
+    triples: list[tuple[int, float, float]],
+    body_width: float,
+) -> tuple[float, float] | None:
+    """
+    Bestimmt die dominante Spaltenbreite aus allen Profilblöcken.
 
-    coverage_by_count: dict[int, int] = {}
-    for hyp in nonzero:
-        coverage_by_count[hyp.column_count] = coverage_by_count.get(hyp.column_count, 0) + 1
+    Breite ist das stabilste Signal: unabhängig von Parity,
+    unabhängig davon ob eine oder zwei Spalten aktiv sind.
 
-    dominant_column_count = max(
-        coverage_by_count.items(),
-        key=lambda item: item[1],
-    )[0]
+    Gibt (w_lo, w_hi) des dominanten Breiten-Peaks zurück.
+    Peaks < 20% oder > 85% der Body-Breite werden übersprungen.
+    """
+    widths = [x1 - x0 for _page, x0, x1 in triples if x1 > x0]
+    if not widths:
+        return None
 
-    coverage_by_count_ratio = {
-        k: v / page_count for k, v in sorted(coverage_by_count.items())
-    }
+    peaks = _histogram_peaks(widths, span_width=body_width)
+    if not peaks:
+        return None
 
-    two_column_coverage = coverage_by_count_ratio.get(2, 0.0)
-    has_secondary_two_column_mode = two_column_coverage >= 0.20
-    mixed_layout = (
-        coverage_by_count_ratio.get(1, 0.0) >= 0.30
-        and two_column_coverage >= 0.20
-    )
+    min_w = body_width * 0.20
+    max_w = body_width * 0.85
 
-    return {
-        "dominant_column_count": dominant_column_count,
-        "coverage_by_count": coverage_by_count_ratio,
-        "mean_score": _mean([h.score for h in nonzero]),
-        "has_secondary_two_column_mode": has_secondary_two_column_mode,
-        "two_column_coverage": two_column_coverage,
-        "mixed_layout": mixed_layout,
-    }
+    plausible = []
+    for lo, hi in peaks:
+        center = (lo + hi) / 2.0
+        if min_w <= center <= max_w:
+            count = sum(1 for _p, x0, x1 in triples if lo <= (x1 - x0) <= hi)
+            plausible.append((count, lo, hi))
+
+    if not plausible:
+        # Fallback: breitester plausibler Peak ohne obere Grenze
+        for lo, hi in sorted(peaks, key=lambda p: -(p[0] + p[1]) / 2):
+            if (lo + hi) / 2 >= min_w:
+                return (lo, hi)
+        return None
+
+    plausible.sort(reverse=True)
+    return (plausible[0][1], plausible[0][2])
 
 
-def _cluster_vertical_candidates(
-    candidates: list[VerticalCandidate],
-    *,
-    x_tol_rel: float,
-    w_tol_rel: float,
+def _infer_column_positions(
+    triples: list[tuple[int, float, float]],
+    body_width: float,
 ) -> list[dict[str, object]]:
     """
-    Dokumentweite Clusterung nach x-Lage und Breite.
+    Spaltenpositions-Inferenz aus (page, x0, x1)-Tripeln.
 
-    Analog zur Furniture-Erkennung:
-    diesmal aber nicht y-Bänder, sondern vertikale x-Bahnen.
+    Algorithmus:
+    1. Dominante Spaltenbreite bestimmen (stabiles Signal)
+    2. Pro Seite: x0-Positionen der Blöcke mit dieser Breite
+    3. Pro Seite: x0-Histogramm → Anzahl Spalten auf dieser Seite
+    4. Maximale beobachtete Spaltenanzahl als Dokument-Spaltenanzahl
+       (nur wenn genug Seiten diese Anzahl zeigen)
+    5. x0-Median pro Spaltenposition → Spaltenkoordinaten
+    6. Marginalie-Kandidaten: schmale Blöcke außerhalb der Spaltenbreite
     """
+    if not triples:
+        return []
+
+    col_width_range = _find_column_width(triples, body_width)
+    if col_width_range is None:
+        return []
+
+    w_lo, w_hi = col_width_range
+    col_width_med = _median([
+        x1 - x0 for _p, x0, x1 in triples
+        if w_lo <= (x1 - x0) <= w_hi
+    ])
+
+    # Blöcke mit dominanter Breite, pro Seite
+    page_x0s: dict[int, list[float]] = {}
+    for page, x0, x1 in triples:
+        if w_lo <= (x1 - x0) <= w_hi:
+            page_x0s.setdefault(page, []).append(x0)
+
+    if not page_x0s:
+        return []
+
+    # Pro Seite: x0-Peaks = Spalten auf dieser Seite
+    page_col_counts: dict[int, int] = {}
+    page_col_x0s: dict[int, list[float]] = {}
+
+    for page, x0s in page_x0s.items():
+        peaks = _histogram_peaks(
+            x0s, span_width=body_width,
+            min_gap_pt=col_width_med * 0.25,
+        )
+        page_col_counts[page] = len(peaks)
+        peak_x0s = []
+        for p_lo, p_hi in sorted(peaks):
+            members = [x for x in x0s if p_lo <= x <= p_hi]
+            if members:
+                peak_x0s.append(_median(members))
+        page_col_x0s[page] = peak_x0s
+
+    # Maximale Spaltenanzahl als vorsichtiges Signal
+    col_count_freq: dict[int, int] = {}
+    for count in page_col_counts.values():
+        col_count_freq[count] = col_count_freq.get(count, 0) + 1
+
+    max_cols = max(page_col_counts.values())
+    pages_with_max = col_count_freq.get(max_cols, 0)
+    total_signal_pages = len(page_col_counts)
+
+    # Mindestens 15% der Seiten müssen maximale Spaltenanzahl zeigen
+    if pages_with_max < max(1, int(total_signal_pages * 0.15)):
+        max_cols = max(col_count_freq.items(), key=lambda kv: kv[1])[0]
+
+    # Auf maximal 3 Spalten begrenzen
+    max_cols = min(max_cols, 3)
+
+    logger.debug(
+        "column_positions: col_width=%.1f max_cols=%d signal_pages=%d",
+        col_width_med, max_cols, total_signal_pages,
+    )
+
+    # x0-Positionen von Seiten mit max_cols Spalten
+    col_x0_lists: list[list[float]] = [[] for _ in range(max_cols)]
+    for page, count in page_col_counts.items():
+        if count == max_cols:
+            x0s = sorted(page_col_x0s[page])
+            for i, x0 in enumerate(x0s[:max_cols]):
+                col_x0_lists[i].append(x0)
+
     clusters: list[dict[str, object]] = []
+    for i, x0_list in enumerate(col_x0_lists):
+        if not x0_list:
+            continue
+        x0_med = _median(x0_list)
+        x1_med = x0_med + col_width_med
 
-    for cand in candidates:
-        assigned = False
+        members_with_page = [
+            (p, x0, x1) for p, x0, x1 in triples
+            if w_lo <= (x1 - x0) <= w_hi
+            and abs(x0 - x0_med) <= body_width * 0.08
+        ]
+        clusters.append({
+            "x0_med": x0_med,
+            "x1_med": x1_med,
+            "block_count": len(members_with_page),
+            "members": [(x0, x1) for _p, x0, x1 in members_with_page],
+            "members_with_page": members_with_page,
+            "is_marginalia_candidate": False,
+        })
 
-        for cluster in clusters:
-            if (
-                abs(cand.x0_rel - cluster["x0_med"]) <= x_tol_rel
-                and abs(cand.x1_rel - cluster["x1_med"]) <= x_tol_rel
-                and abs(cand.width_rel - cluster["w_med"]) <= w_tol_rel
-            ):
-                cluster["members"].append(cand)
-                cluster["x0_med"] = _median([m.x0_rel for m in cluster["members"]])
-                cluster["x1_med"] = _median([m.x1_rel for m in cluster["members"]])
-                cluster["w_med"] = _median([m.width_rel for m in cluster["members"]])
-                assigned = True
-                break
+    # Marginalie-Kandidaten: Blöcke schmal und am Rand
+    margin_max_w = col_width_med * 0.60
+    all_width_peaks = _histogram_peaks(
+        [x1 - x0 for _p, x0, x1 in triples if x1 > x0],
+        span_width=body_width,
+    )
+    for p_lo, p_hi in all_width_peaks:
+        # Überlapp mit dominantem Peak überspringen
+        if p_lo <= w_hi and p_hi >= w_lo:
+            continue
+        if (p_lo + p_hi) / 2 >= margin_max_w:
+            continue
 
-        if not assigned:
-            clusters.append(
-                {
-                    "members": [cand],
-                    "x0_med": cand.x0_rel,
-                    "x1_med": cand.x1_rel,
-                    "w_med": cand.width_rel,
-                }
-            )
+        margin_members = [
+            (p, x0, x1) for p, x0, x1 in triples
+            if p_lo <= (x1 - x0) <= p_hi
+        ]
+        if not margin_members:
+            continue
 
+        x0_peaks = _histogram_peaks(
+            [x0 for _p, x0, _x1 in margin_members],
+            span_width=body_width,
+        )
+        for mp_lo, mp_hi in x0_peaks:
+            m = [(p, x0, x1) for p, x0, x1 in margin_members if mp_lo <= x0 <= mp_hi]
+            if not m:
+                continue
+            clusters.append({
+                "x0_med": _median([x0 for _p, x0, _x1 in m]),
+                "x1_med": _median([x1 for _p, _x0, x1 in m]),
+                "block_count": len(m),
+                "members": [(x0, x1) for _p, x0, x1 in m],
+                "members_with_page": m,
+                "is_marginalia_candidate": True,
+            })
+
+    clusters.sort(
+        key=lambda c: (not c["is_marginalia_candidate"], c["block_count"]),
+        reverse=True,
+    )
     return clusters
 
 
-def _score_vertical_cluster(
-    cluster: dict[str, object],
-    *,
-    page_count: int,
-) -> float:
-    """
-    Bewertet einen dokumentweiten x-Cluster.
-
-    Hybrid-Idee:
-    - globale Präsenz
-    - robuste Höhe
-    - stabile x-Lage/Breite
-    - aber keine harten Ausschlüsse außer völlig unplausiblen Fällen
-    """
-    members: list[VerticalCandidate] = cluster["members"]
-    if not members:
-        return -1e9
-
-    pages_present = len({m.page_index for m in members})
-    coverage_ratio = pages_present / max(1, page_count)
-
-    x0_values = [m.x0_rel for m in members]
-    x1_values = [m.x1_rel for m in members]
-    width_values = [m.width_rel for m in members]
-    height_values = [m.coverage_rel for m in members]
-
-    x_stability = max(x0_values) - min(x0_values) + max(x1_values) - min(x1_values)
-    w_stability = max(width_values) - min(width_values)
-
-    height_med = _median(height_values)
-    height_p25 = _percentile(height_values, 0.25)
-    width_med = _median(width_values)
-
-    if coverage_ratio < 0.03:
-        return -1e9
-    if width_med < 0.04:
-        return -1e9
-
-    score = (
-        5.0 * coverage_ratio
-        + 3.0 * height_med
-        + 3.0 * height_p25
-        + 2.0 * width_med
-        - 4.0 * x_stability
-        - 2.0 * w_stability
-    )
-
-    if coverage_ratio < 0.08:
-        score -= 1.5
-    if height_med < 0.15:
-        score -= 1.5
-    if width_med < 0.06:
-        score -= 1.0
-
-    return score
-
-
-def _clusters_overlap(
-    a: tuple[float, float],
-    b: tuple[float, float],
-    tol: float = 0.02,
-) -> bool:
-    return max(a[0], b[0]) <= min(a[1], b[1]) + tol
-
-
-def _select_best_column_clusters(
-    clusters: list[dict[str, object]],
-    *,
-    page_count: int,
-    max_columns: int = 3,
+def _cluster_pairs(
+    pairs_odd: list[tuple[float, float]],
+    pairs_even: list[tuple[float, float]],
+    body_width: float,
+    pairs_all_with_page: list[tuple[int, float, float]] | None = None,
 ) -> list[dict[str, object]]:
-    scored: list[tuple[float, dict[str, object]]] = []
-    for cluster in clusters:
-        score = _score_vertical_cluster(cluster, page_count=page_count)
-        if score > 0:
-            scored.append((score, cluster))
+    """Haupteinstieg: delegiert an _infer_column_positions."""
+    if pairs_all_with_page:
+        return _infer_column_positions(pairs_all_with_page, body_width)
+    # Fallback ohne Seiteninformation
+    all_pairs = pairs_odd + pairs_even
+    fake_triples = [(i % 2, x0, x1) for i, (x0, x1) in enumerate(all_pairs)]
+    return _infer_column_positions(fake_triples, body_width)
 
-    scored.sort(key=lambda item: item[0], reverse=True)
 
-    selected: list[dict[str, object]] = []
-    selected_ranges: list[tuple[float, float]] = []
+def _collect_pairs_for_pages(
+    blocks_by_page: dict[int, list[tuple[float, float]]],
+    page_indexes: list[int],
+) -> list[tuple[int, float, float]]:
+    """Gibt (page_index, x0, x1) für alle relevanten Seiten zurück."""
+    result: list[tuple[int, float, float]] = []
+    for page_index in page_indexes:
+        for x0, x1 in blocks_by_page.get(page_index, []):
+            result.append((page_index, x0, x1))
+    return result
 
-    for score, cluster in scored:
-        x_range = (cluster["x0_med"], cluster["x1_med"])
-        if any(_clusters_overlap(x_range, existing) for existing in selected_ranges):
+
+def _split_by_parity(
+    triples: list[tuple[int, float, float]],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Trennt (page, x0, x1) nach odd/even-Parität."""
+    odd:  list[tuple[float, float]] = []
+    even: list[tuple[float, float]] = []
+    for page, x0, x1 in triples:
+        if _is_odd_page(page):
+            odd.append((x0, x1))
+        else:
+            even.append((x0, x1))
+    return odd, even
+
+
+# ---------------------------------------------------------------------------
+# Spalten vs. Marginalien
+# ---------------------------------------------------------------------------
+
+
+def _classify_clusters(
+    clusters: list[dict[str, object]],
+    body_x0: float,
+    body_x1: float,
+    body_width: float,
+    page_count: int,
+    profile_page_count: int,
+) -> tuple[list[ColumnLane], list[ColumnLane]]:
+    """
+    Identifiziert gleichwertige Spalten durch paarweisen Symmetrie-Vergleich.
+
+    Zwei Cluster sind gleichwertige Spalten wenn sie sich in Breite und
+    Häufigkeit ähneln:
+      - Breiten-Verhältnis:     min(w0,w1) / max(w0,w1) > 0.5
+      - Häufigkeits-Verhältnis: min(c0,c1) / max(c0,c1) > 0.4
+
+    Cluster die diesen Test nicht bestehen, werden als Nebeninhalt
+    ignoriert — weder Spalte noch Marginalie.
+
+    Ausnahme: Wenn nur ein Cluster existiert, ist er die einzige Spalte.
+    """
+    if not clusters:
+        return [], []
+
+    def _pages(cluster: dict) -> int:
+        n = len({pi for pi, _, _ in cluster.get("members_with_page", [])})
+        return n if n > 0 else max(1, cluster["block_count"] // max(1, profile_page_count // 3))
+
+    # Einzelner Cluster → immer Spalte
+    if len(clusters) == 1:
+        c = clusters[0]
+        x0, x1 = float(c["x0_med"]), float(c["x1_med"])
+        if x1 <= x0:
+            return [], []
+        pages_present = _pages(c)
+        lane = ColumnLane(
+            index=0, x0=x0, x1=x1,
+            pages_present=pages_present,
+            coverage_ratio=pages_present / max(1, page_count),
+            block_count=int(c["block_count"]),
+            is_marginalia=False,
+        )
+        logger.debug("single cluster -> column x0=%.1f x1=%.1f", x0, x1)
+        return [lane], []
+
+    # Mehrere Cluster: paarweiser Symmetrie-Test gegen den haeufigsten
+    primary = clusters[0]
+    w_primary = float(primary["x1_med"]) - float(primary["x0_med"])
+    c_primary = int(primary["block_count"])
+
+    column_clusters: list[dict] = [primary]
+
+    for cluster in clusters[1:]:
+        x0 = float(cluster["x0_med"])
+        x1 = float(cluster["x1_med"])
+        if x1 <= x0:
             continue
 
-        selected.append(cluster | {"score": score})
-        selected_ranges.append(x_range)
+        w = x1 - x0
+        c = int(cluster["block_count"])
 
-        if len(selected) >= max_columns:
-            break
+        width_ratio = min(w, w_primary) / max(w, w_primary, 1e-6)
+        count_ratio = min(c, c_primary) / max(c, c_primary, 1e-6)
 
-    selected.sort(key=lambda c: c["x0_med"])
-    return selected
+        is_marginalia_candidate = cluster.get("is_marginalia_candidate", False)
+
+        # Gleichbreite Kandidaten (width_ratio > 0.85) sind echte Spalten,
+        # auch wenn sie als Marginalie-Kandidaten markiert sind.
+        # Dieser Fall tritt auf wenn zwei Spalten gleiche Breite haben
+        # und beide in den gleichen Breiten-Peak fallen.
+        equally_wide = width_ratio > 0.85
+
+        is_column = (
+            (not is_marginalia_candidate or equally_wide)
+            and width_ratio > 0.5
+            and count_ratio > 0.4
+        )
+
+        logger.debug(
+            "cluster x0=%.1f x1=%.1f w=%.1f count=%d "
+            "width_ratio=%.2f count_ratio=%.2f marg_cand=%s -> %s",
+            x0, x1, w, c, width_ratio, count_ratio,
+            is_marginalia_candidate,
+            "column" if is_column else "ignored",
+        )
+
+        if is_column:
+            column_clusters.append(cluster)
+
+    # Spalten aus column_clusters bauen
+    lanes: list[ColumnLane] = []
+    for idx, c in enumerate(column_clusters):
+        x0 = float(c["x0_med"])
+        x1 = float(c["x1_med"])
+        pages_present = _pages(c)
+        lanes.append(ColumnLane(
+            index=idx, x0=x0, x1=x1,
+            pages_present=pages_present,
+            coverage_ratio=pages_present / max(1, page_count),
+            block_count=int(c["block_count"]),
+            is_marginalia=False,
+        ))
+
+    # Marginalien: Cluster die als is_marginalia_candidate markiert sind
+    # (vom Breiten-Clustering als Nebenpeak identifiziert) UND am Rand liegen.
+    marginalia: list[ColumnLane] = []
+    margin_edge_tol = body_width * 0.15
+
+    for cluster in clusters:
+        x0 = float(cluster["x0_med"])
+        x1 = float(cluster["x1_med"])
+        if x1 <= x0:
+            continue
+        # Bereits als Spalte erfasst? Überspringen.
+        if any(abs(l.x0 - x0) < body_width * 0.05
+               and abs(l.x1 - x1) < body_width * 0.05
+               for l in lanes):
+            continue
+
+        is_candidate = cluster.get("is_marginalia_candidate", False)
+        at_left  = x0 <= body_x0 + margin_edge_tol
+        at_right = x1 >= body_x1 - margin_edge_tol
+
+        if is_candidate and (at_left or at_right):
+            pages_present = _pages(cluster)
+            marginalia.append(ColumnLane(
+                index=len(marginalia),
+                x0=x0, x1=x1,
+                pages_present=pages_present,
+                coverage_ratio=pages_present / max(1, page_count),
+                block_count=int(cluster["block_count"]),
+                is_marginalia=True,
+            ))
+            logger.debug(
+                "marginalia x0=%.1f x1=%.1f w=%.1f at_left=%s at_right=%s",
+                x0, x1, x1 - x0, at_left, at_right,
+            )
+
+    return lanes, marginalia
 
 
-def _merge_close_or_overlapping_lanes(
+def _merge_overlapping_lanes(
     lanes: list[ColumnLane],
     body_width: float,
 ) -> list[ColumnLane]:
+    """Führt überlappende oder sehr nahe Spalten zusammen."""
     if not lanes:
         return []
 
-    lanes = sorted(lanes, key=lambda lane: lane.x0)
-    merged: list[ColumnLane] = [lanes[0]]
+    lanes = sorted(lanes, key=lambda l: l.x0)
+    merged = [lanes[0]]
 
     for lane in lanes[1:]:
         prev = merged[-1]
-
         gap = lane.x0 - prev.x1
         overlap = min(prev.x1, lane.x1) - max(prev.x0, lane.x0)
         min_width = max(1e-6, min(prev.width, lane.width))
@@ -811,7 +705,8 @@ def _merge_close_or_overlapping_lanes(
                 x1=max(prev.x1, lane.x1),
                 pages_present=max(prev.pages_present, lane.pages_present),
                 coverage_ratio=max(prev.coverage_ratio, lane.coverage_ratio),
-                block_count=max(prev.block_count, lane.block_count),
+                block_count=prev.block_count + lane.block_count,
+                is_marginalia=False,
             )
         else:
             merged.append(lane)
@@ -822,148 +717,306 @@ def _merge_close_or_overlapping_lanes(
     return merged
 
 
+# ---------------------------------------------------------------------------
+# Seitenweise Observation
+# ---------------------------------------------------------------------------
+
+
+def _observe_page_columns(
+    pairs: list[tuple[float, float]],
+    profile_lanes: list[ColumnLane],
+    body_width: float,
+    page_index: int,
+) -> PageVerticalObservation:
+    """
+    Vergleicht die Blöcke einer Seite mit dem dokumentweiten Profil.
+
+    Eine Profil-Spur gilt als "vorhanden" wenn mindestens ein Block
+    der Seite innerhalb der Spur-Grenzen liegt (mit kleiner Toleranz).
+    """
+    tol = body_width * 0.04
+    observed_ranges: list[tuple[float, float]] = []
+
+    for lane in profile_lanes:
+        present = any(
+            x0 >= lane.x0 - tol and x1 <= lane.x1 + tol
+            for x0, x1 in pairs
+        )
+        if present:
+            observed_ranges.append((lane.x0, lane.x1))
+
+    score = len(observed_ranges) / max(1, len(profile_lanes)) if profile_lanes else 0.0
+
+    return PageVerticalObservation(
+        page_index=page_index,
+        parity="odd" if _is_odd_page(page_index) else "even",
+        observed_column_count=len(observed_ranges),
+        observed_lane_ranges=observed_ranges,
+        score=score,
+        candidate_line_count=len(pairs),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Öffentliche API: infer_vertical_profile
+# ---------------------------------------------------------------------------
+
+
+def infer_vertical_profile(
+    pdf_path: Path,
+    page_body_regions: list[BodyRegion | None],
+    page_count: int,
+    document_body_region: BodyRegion,
+    page_image_rects: dict[int, list[tuple[float, float, float, float]]] | None = None,
+    profile_page_indexes: list[int] | None = None,
+) -> tuple[VerticalProfile, list[PageVerticalObservation], list[object]]:
+    """
+    Inferiert das vertikale Profil (Spalten + Marginalien) eines Dokuments.
+
+    Ablauf:
+    1. (x0, x1)-Paare aller Textblöcke im Body extrahieren
+    2. Auf Profilseiten (mittleres Drittel) beschränken
+    3. x0-Clustering mit Median + MAD
+    4. Spalten vs. Marginalien klassifizieren
+    5. Seitenweise Observations gegen Profil
+    """
+    MIN_PROFILE_PAGES = 3
+    if profile_page_indexes is not None and len(profile_page_indexes) >= MIN_PROFILE_PAGES:
+        candidate_pages = profile_page_indexes
+    else:
+        candidate_pages = _middle_page_indexes(page_count)
+
+    blocks_by_page = extract_blocks_in_body(
+        pdf_path=pdf_path,
+        page_body_regions=page_body_regions,
+        page_image_rects=page_image_rects,
+    )
+
+    # Profilseiten nach Textdichte filtern:
+    # Seiten mit weniger als 4 Textblöcken sind Bild-, Kapitel- oder Leerseiten
+    # und liefern kein repräsentatives Signal.
+    MIN_BLOCKS_PER_PROFILE_PAGE = 4
+    profile_pages = [
+        p for p in candidate_pages
+        if len(blocks_by_page.get(p, [])) >= MIN_BLOCKS_PER_PROFILE_PAGE
+    ]
+
+    # Falls zu wenige textile Seiten im mittleren Drittel: auf gesamtes Dokument ausweiten
+    if len(profile_pages) < MIN_PROFILE_PAGES:
+        profile_pages = [
+            p for p in range(page_count)
+            if len(blocks_by_page.get(p, [])) >= MIN_BLOCKS_PER_PROFILE_PAGE
+        ]
+        # Titelseiten und erste Seiten tendenziell ausschließen
+        if len(profile_pages) > MIN_PROFILE_PAGES:
+            profile_pages = [p for p in profile_pages if p >= min(2, page_count // 10)]
+
+    # Notfall-Fallback: alle Seiten mit irgendeinem Text
+    if not profile_pages:
+        profile_pages = [p for p in range(page_count) if blocks_by_page.get(p)]
+
+    logger.debug(
+        "profile_pages: %d textreiche Seiten (von %d Kandidaten)",
+        len(profile_pages), len(candidate_pages),
+    )
+
+    # Nur Profilseiten für Clustering
+    profile_triples = _collect_pairs_for_pages(blocks_by_page, profile_pages)
+
+    body_width = document_body_region.width
+
+    # x1-Clustering, odd/even getrennt, dann zusammenführen
+    pairs_odd, pairs_even = _split_by_parity(profile_triples)
+    clusters = _cluster_pairs(
+        pairs_odd, pairs_even, body_width,
+        pairs_all_with_page=profile_triples,
+    )
+
+    # Seiteninformation in Cluster zurückschreiben für coverage
+    for cluster in clusters:
+        x1_med = float(cluster["x1_med"])
+        tol = body_width * 0.08
+        cluster["members_with_page"] = [
+            (page, x0, x1)
+            for page, x0, x1 in profile_triples
+            if abs(x1 - x1_med) <= tol
+        ]
+
+    lanes, marginalia = _classify_clusters(
+        clusters=clusters,
+        body_x0=document_body_region.x0,
+        body_x1=document_body_region.x1,
+        body_width=body_width,
+        page_count=page_count,
+        profile_page_count=len(profile_pages),
+    )
+
+    lanes = _merge_overlapping_lanes(lanes, body_width)
+
+    # Maximale Spaltenanzahl: 2 — mehr ist für wissenschaftliche Literatur
+    # nicht realistisch und deutet auf Clustering-Artefakte hin
+    if len(lanes) > 2:
+        lanes = sorted(lanes, key=lambda l: l.block_count, reverse=True)[:2]
+        lanes = sorted(lanes, key=lambda l: l.x0)
+        for i, lane in enumerate(lanes):
+            lane.index = i
+
+    column_count = len(lanes) if lanes else 1
+
+    gaps = [
+        max(0.0, right.x0 - left.x1)
+        for left, right in zip(lanes, lanes[1:])
+    ]
+    dominant_gap = _mean(gaps) if gaps else None
+
+    confidence = _mean([
+        len({p for p, _, _ in c.get("members_with_page", [])}) / max(1, len(profile_pages))
+        for c in clusters[:column_count]
+    ]) if clusters else 0.0
+
+    logger.debug(
+        "vertical_profile columns=%d gap=%s confidence=%.3f "
+        "profile_pages=%d marginalia=%d",
+        column_count, dominant_gap, confidence,
+        len(profile_pages), len(marginalia),
+    )
+
+    # Seitenweise Observations
+    observations: list[PageVerticalObservation] = []
+    for page_index in range(page_count):
+        pairs = blocks_by_page.get(page_index, [])
+        obs = _observe_page_columns(pairs, lanes, body_width, page_index)
+        observations.append(obs)
+
+    diagnostics = {
+        "profile_pages": [p + 1 for p in profile_pages],
+        "cluster_count": len(clusters),
+        "clusters": [
+            {
+                "x0_med": float(c["x0_med"]),
+                "x1_med": float(c["x1_med"]),
+                "block_count": int(c["block_count"]),
+            }
+            for c in clusters
+        ],
+        "column_lanes": [l.to_dict() for l in lanes],
+        "marginalia": [l.to_dict() for l in marginalia],
+    }
+
+    profile = VerticalProfile(
+        page_count=page_count,
+        profile_pages=list(profile_pages),
+        dominant_column_count=column_count,
+        dominant_column_lanes=lanes,
+        dominant_gap=dominant_gap,
+        marginalia_candidates=marginalia,
+        confidence=confidence,
+        diagnostics=diagnostics,
+    )
+
+    return profile, observations, []
+
+
+# ---------------------------------------------------------------------------
+# Öffentliche API: match_page_to_vertical_profile
+# ---------------------------------------------------------------------------
+
+
+def _range_overlap_ratio(a: tuple[float, float], b: tuple[float, float]) -> float:
+    inter = min(a[1], b[1]) - max(a[0], b[0])
+    if inter <= 0:
+        return 0.0
+    denom = max(1e-6, min(a[1] - a[0], b[1] - b[0]))
+    return inter / denom
+
+
+def match_page_to_vertical_profile(
+    profile: VerticalProfile,
+    observation: PageVerticalObservation,
+    page_body_region: BodyRegion | None,
+) -> VerticalMatch:
+    expected = int(profile.dominant_column_count or 0)
+    observed = int(observation.observed_column_count or 0)
+
+    expected_ranges: list[tuple[float, float]] = [
+        (lane.x0, lane.x1) for lane in profile.dominant_column_lanes
+    ]
+
+    matched_lane_indices: list[int] = []
+    for i, exp_range in enumerate(expected_ranges):
+        if any(
+            _range_overlap_ratio(exp_range, obs_range) >= 0.50
+            for obs_range in observation.observed_lane_ranges
+        ):
+            matched_lane_indices.append(i)
+
+    deviation_types: list[str] = []
+    deviation_score = 0.0
+
+    if observed < expected:
+        deviation_types.append("missing_columns")
+        deviation_score += 0.75
+    elif observed > expected:
+        deviation_types.append("extra_columns")
+        deviation_score += 0.45
+
+    if expected_ranges and len(matched_lane_indices) < min(expected, len(expected_ranges)):
+        deviation_types.append("lane_position_mismatch")
+        deviation_score += 0.35
+
+    if expected <= 1:
+        column_match = observed == expected
+    else:
+        column_match = (
+            observed == expected
+            and len(matched_lane_indices) >= min(expected, len(expected_ranges))
+        )
+
+    return VerticalMatch(
+        page_index=observation.page_index,
+        column_match=column_match,
+        observed_column_count=observed,
+        expected_column_count=expected,
+        matched_lane_indices=matched_lane_indices,
+        deviation_score=min(1.0, deviation_score),
+        deviation_types=deviation_types,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kompatibilitäts-Wrapper für geometry.py
+# ---------------------------------------------------------------------------
+
+
 def detect_column_lanes(
     pdf_path: Path,
     page_body_regions: list[BodyRegion | None],
     page_count: int,
     document_body_region: BodyRegion,
-) -> tuple[int, list[float], float | None, list[ColumnLane], list[ColumnBox], dict[str, object]]:
-    """
-    Dokumentweite Spaltenerkennung.
-
-    Hybrid-Leitidee:
-    - seitenlokale vertikale Kandidaten innerhalb des Body erzeugen
-    - nach x-Lage dokumentweit clustern
-    - die robusten Cluster als Spalten wählen
-    - Seitenhypothesen als Rückfall- und Stabilisierungssignal verwenden
-    """
-    line_boxes = extract_text_line_boxes(
+    page_image_rects: dict[int, list[tuple[float, float, float, float]]] | None = None,
+    profile_page_indexes: list[int] | None = None,
+) -> tuple[int, list[float], float | None, list[ColumnLane], list[object], dict[str, object]]:
+    """Wrapper für geometry.py-Kompatibilität."""
+    profile, _observations, column_boxes = infer_vertical_profile(
         pdf_path=pdf_path,
         page_body_regions=page_body_regions,
-    )
-
-    column_boxes = build_column_compatible_boxes(
-        line_boxes=line_boxes,
-        page_body_regions=page_body_regions,
-    )
-
-    candidate_map = _build_page_vertical_candidates_map(
-        column_boxes=column_boxes,
-        page_body_regions=page_body_regions,
-    )
-
-    all_candidates = [
-        cand
-        for candidates in candidate_map.values()
-        for cand in candidates
-    ]
-
-    clusters = _cluster_vertical_candidates(
-        all_candidates,
-        x_tol_rel=0.08,
-        w_tol_rel=0.10,
-    )
-
-    selected_clusters = _select_best_column_clusters(
-        clusters,
         page_count=page_count,
-        max_columns=3,
+        document_body_region=document_body_region,
+        page_image_rects=page_image_rects,
+        profile_page_indexes=profile_page_indexes,
     )
 
-    abs_lanes: list[ColumnLane] = []
-    cluster_debug: list[dict[str, object]] = []
-
-    for idx, cluster in enumerate(selected_clusters):
-        members: list[VerticalCandidate] = cluster["members"]
-        pages_present = len({m.page_index for m in members})
-        coverage_ratio = pages_present / max(1, page_count)
-
-        x0_abs = document_body_region.x0 + cluster["x0_med"] * document_body_region.width
-        x1_abs = document_body_region.x0 + cluster["x1_med"] * document_body_region.width
-
-        abs_lanes.append(
-            ColumnLane(
-                index=idx,
-                x0=x0_abs,
-                x1=x1_abs,
-                pages_present=pages_present,
-                coverage_ratio=coverage_ratio,
-                block_count=sum(m.block_count for m in members),
-            )
-        )
-
-        cluster_debug.append(
-            {
-                "index": idx,
-                "score": cluster["score"],
-                "x0_rel": cluster["x0_med"],
-                "x1_rel": cluster["x1_med"],
-                "width_rel": cluster["w_med"],
-                "pages_present": pages_present,
-                "coverage_ratio": coverage_ratio,
-                "height_median": _median([m.coverage_rel for m in members]),
-                "height_p25": _percentile([m.coverage_rel for m in members], 0.25),
-            }
-        )
-
-    abs_lanes = _merge_close_or_overlapping_lanes(abs_lanes, document_body_region.width)
-    abs_lanes = [
-        lane for lane in abs_lanes
-        if lane.width >= document_body_region.width * 0.12
-    ]
-
-    abs_lanes.sort(key=lambda l: l.x0)
-    for i, lane in enumerate(abs_lanes):
-        lane.index = i
-
-    column_count = len(abs_lanes) if abs_lanes else 1
-
-    page_hypotheses = build_page_column_hypotheses(
-        line_boxes=line_boxes,
-        page_body_regions=page_body_regions,
-        page_count=page_count,
+    widths = (
+        [lane.width for lane in profile.dominant_column_lanes]
+        if profile.dominant_column_lanes
+        else [document_body_region.width]
     )
-    summary = summarize_page_column_hypotheses(
-        hypotheses=page_hypotheses,
-        page_count=page_count,
+
+    return (
+        profile.dominant_column_count,
+        widths,
+        profile.dominant_gap,
+        profile.dominant_column_lanes,
+        column_boxes,
+        profile.diagnostics,
     )
-    dominant_count = int(summary.get("dominant_column_count", 1) or 1)
-
-    if column_count == 1 and dominant_count > 1:
-        column_count = dominant_count
-
-    if not abs_lanes:
-        widths = [document_body_region.width]
-        gap = None
-    else:
-        widths = [lane.width for lane in abs_lanes]
-        gaps = [
-            max(0.0, right.x0 - left.x1)
-            for left, right in zip(abs_lanes, abs_lanes[1:])
-        ]
-        gap = _mean(gaps) if gaps else None
-
-    diagnostics = {
-        "line_box_count": len(line_boxes),
-        "column_box_count": len(column_boxes),
-        "vertical_candidate_count": len(all_candidates),
-        "vertical_candidates_by_page": {
-            page_index: [cand.to_dict() for cand in candidates]
-            for page_index, candidates in candidate_map.items()
-        },
-        "vertical_clusters": cluster_debug,
-        "page_column_hypotheses": [h.to_dict() for h in page_hypotheses],
-        "page_column_summary": summary,
-    }
-
-    if column_count == 1 and abs_lanes:
-        if abs_lanes[0].width >= document_body_region.width * 0.85:
-            return 1, [document_body_region.width], None, [], column_boxes, diagnostics
-
-    if page_count < 6 and column_count > 2:
-        return 1, [document_body_region.width], None, [], column_boxes, diagnostics
-
-    if column_count > 2:
-        column_count = 2
-
-    return column_count, widths, gap, abs_lanes, column_boxes, diagnostics
