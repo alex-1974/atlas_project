@@ -103,6 +103,104 @@ Body heraushalten. Direkter Impact auf Keywords, FTS und Embeddings.
 - RVK-Qualität: Topic als primäre Suchanfrage
 - GND: `broaderTermInstantial` für Topic-Hierarchie
 
+Erweiterung zu Phase 3 — Layout- und Geometrieanalyse
+Phase 3.1 — Robuste Header- und Footer-Erkennung ✓ abgeschlossen
+
+Ziel: Zuverlässige Identifikation wiederkehrender Seitenbereiche zur Verbesserung des Document Understanding.
+
+Leitprinzip: Header und Footer werden als wiederkehrende horizontale Bänder („Furniture“) modelliert und durch eine Kombination aus statistischer Mustererkennung und lokaler Seitenheuristik erkannt.
+
+Geliefert:
+
+Einführung des Konzepts der Furniture Bands (Header/Footer)
+Statistische Mustererkennung auf Basis wiederkehrender y0/y1-Positionen
+Normalisierung der Koordinaten auf die Seitenhöhe
+Clustering stabiler Kandidaten über mehrere Seiten
+Unterstützung für gerade und ungerade Seiten
+Adaptive Strategien abhängig von der Dokumentlänge
+Kombination aus globaler Mustererkennung und lokaler Seitenheuristik
+Qualitätsbasierte Entscheidungslogik mit Fallback-Mechanismen
+Integration in die Geometrie- und DU-Pipeline
+Erweiterte Debug- und Analysewerkzeuge
+
+Neue Module und Funktionen:
+
+atlas.parse.zones
+detect_repeated_furniture_bands
+decide_page_has_furniture
+atlas.parse.geometry
+build_page_layout_signatures
+atlas.eval.geometry_eval
+Analyse-Skripte:
+analyze_geometry_errors.py
+analyze_footer_candidates.py
+analyze_header_footer_zones.py
+debug_header_candidates.py
+
+Erreichte Qualität (Testkorpus, April 2026):
+
+Metrik	Ergebnis
+Column Accuracy	0.775
+Header Recall	0.913
+Header F1	0.326
+Footer Precision	0.997
+Footer Recall	0.911
+Footer F1	0.952
+
+Erkenntnisse:
+
+Footer sind aufgrund stabiler Seitennummern einfacher zu erkennen.
+Header sind variabler und erfordern zusätzliche strukturelle Filter.
+Der Abstand zum Body ist ein entscheidendes Differenzierungsmerkmal.
+Kapitelüberschriften stellen die häufigste Quelle für False Positives dar.
+Phase 3.2 — Optimierung der Header-Präzision (laufend)
+
+Ziel: Reduktion von False Positives bei gleichbleibend hohem Recall.
+
+Geplante Maßnahmen:
+
+Strengere Positionsfilter für Header
+Nutzung des Abstands zwischen Header und Body
+Stabilitätsanalyse von Höhe und Position
+Slot-basierte Mustererkennung (links, mittig, rechts)
+Dokumentklassenabhängige Schwellwerte
+Erweiterte Qualitätsmetriken für Furniture-Bänder
+Verbesserte Filterung von Kapitelüberschriften und Titelseiten
+
+Zielmetriken:
+
+Metrik	Aktuell	Ziel Phase 3
+Header Precision	niedrig	≥ 0.80
+Header Recall	0.913	≥ 0.90
+Header F1	0.326	≥ 0.75
+Footer F1	0.952	≥ 0.96
+Phase 3.3 — Integration in die DU-Pipeline (geplant)
+
+Ziel: Verbesserung der strukturellen Analyse und Textqualität.
+
+Erwartete Auswirkungen:
+
+Entfernung von Running Headers und Footers aus dem Fließtext
+Verbesserung der Titel- und Autorenextraktion
+Präzisere Keyword- und Topic-Extraktion
+Stabilere Section-Tree-Erkennung
+Höhere Qualität von Embeddings und Suchergebnissen
+
+Betroffene Komponenten:
+
+atlas.parse.zones
+atlas.parse.geometry
+atlas.pipeline.extract.layout
+atlas.pipeline.profiling
+atlas.eval.geometry_eval
+Ergänzung zu den Qualitätszielen von Phase 3
+Metrik	Ziel
+Header-Erkennungsgenauigkeit	≥ 85%
+Footer-Erkennungsgenauigkeit	≥ 95%
+Entfernung von Running Headers	≥ 90%
+Entfernung von Seitenzahlen	≥ 98%
+Stabilität der Layoutsignaturen	≥ 95%
+
 ---
 
 ### Phase 4 — Reife & Produktivität

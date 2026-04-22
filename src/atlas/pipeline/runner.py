@@ -47,21 +47,6 @@ def _set_status(conn: sqlite3.Connection, document_id: str,
 
 # ── Extraction wrappers ───────────────────────────────────────────────────────
 
-def _run_extract_text(catalog_root: Path, document_id: str, pdf_path: str) -> None:
-    """Extract text via PyMuPDF with pdftotext fallback."""
-    from atlas.db.connection import set_catalog_path
-    set_catalog_path(catalog_root)
-    from atlas.extract.text_pymupdf import extract_text_pymupdf
-    extract_text_pymupdf(Path(pdf_path), document_id, force=False)
-
-
-def _run_extract_metadata(catalog_root: Path, document_id: str, pdf_path: str) -> None:
-    from atlas.db.connection import set_catalog_path
-    set_catalog_path(catalog_root)
-    from atlas.extract.pdf_metadata import extract_pdf_metadata
-    extract_pdf_metadata()
-
-
 def _run_extract_identifiers(catalog_root: Path, document_id: str) -> None:
     from atlas.db.connection import set_catalog_path
     set_catalog_path(catalog_root)
@@ -74,12 +59,6 @@ def _run_normalize_identifiers(catalog_root: Path) -> None:
     set_catalog_path(catalog_root)
     from atlas.normalize.identifiers import normalize_identifiers
     normalize_identifiers()
-
-
-def _run_extract_layout(conn: sqlite3.Connection,
-                        document_id: str, pdf_path: str) -> None:
-    from atlas.pipeline.extract.layout import run_extract_layout
-    run_extract_layout(conn, document_id, pdf_path)
 
 
 # ── Post-DU helpers ───────────────────────────────────────────────────────────
@@ -238,7 +217,6 @@ def _promote_du_metadata(conn: sqlite3.Connection, document_id: str) -> None:
             ).fetchall()))
 
         if author_rows:
-            from atlas.understanding.core.text_patterns import normalize_letter_spaced
             authors = []
             for row_a in author_rows:
                 text = " ".join(normalize_letter_spaced(row_a["text"] or "").split())
@@ -292,16 +270,44 @@ def _promote_identifiers(conn: sqlite3.Connection, document_id: str) -> None:
     conn.commit()
 
 
-def _update_fts(conn: sqlite3.Connection, document_id: str) -> None:
-    """Refresh the FTS5 index for this document."""
+def _update_fts(
+    conn: sqlite3.Connection,
+    document_id: str,
+    parsed=None,
+) -> None:
+    """Refresh the FTS5 index for this document.
+
+    Nutzt ParsedDocument.sections für body_text wenn verfügbar,
+    sonst Fallback auf extracted_texts (alte Architektur).
+    """
     row = conn.execute(
         "SELECT title, abstract FROM documents WHERE document_id = ?",
         (document_id,),
     ).fetchone()
-    text_row = conn.execute(
-        "SELECT text FROM extracted_texts WHERE document_id = ?",
-        (document_id,),
-    ).fetchone()
+
+    # Body-Text aus ParsedDocument.sections zusammensetzen
+    body_text: str | None = None
+    if parsed is not None and hasattr(parsed, "sections") and parsed.sections:
+        parts = []
+        if hasattr(parsed, "metadata") and parsed.metadata:
+            if parsed.metadata.abstract:
+                parts.append(parsed.metadata.abstract)
+        for sec in parsed.sections:
+            if sec.title:
+                parts.append(sec.title)
+        body_text = " ".join(parts)[:50_000] if parts else None
+
+    # Fallback: extracted_texts (alte Architektur)
+    if body_text is None:
+        try:
+            text_row = conn.execute(
+                "SELECT text FROM extracted_texts WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            if text_row:
+                body_text = text_row["text"][:50_000]
+        except Exception:
+            pass
 
     conn.execute(
         "DELETE FROM documents_fts WHERE document_id = ?", (document_id,)
@@ -313,7 +319,7 @@ def _update_fts(conn: sqlite3.Connection, document_id: str) -> None:
             document_id,
             row["title"]    if row else None,
             row["abstract"] if row else None,
-            text_row["text"][:50_000] if text_row else None,
+            body_text,
         ),
     )
     conn.commit()
@@ -386,32 +392,32 @@ def run_pipeline(
             from atlas.db.connection import set_catalog_path
             set_catalog_path(catalog_root)
 
-        # ── Pass 0: Pre-classification ────────────────────────────────────
-        # Runs before any DU step. Determines book_score / structure_score
-        # and boost signals. The profile is passed to run_du_pipeline() so
-        # the Aggregate layer can apply quadrant-specific weights.
-        from atlas.pipeline.profiling import profile_document
-        profile = profile_document(Path(pdf_path))
+        # ── Parse-Pipeline (atlas.parse) ─────────────────────────────────
+        # Ersetzt understanding-basierte DU-Schritte durch direkten
+        # PyMuPDF-Ansatz: Geometry → Typography → Zones → Hint → Metadata
+        # → Sections → Persistenz in SQLite.
+        from atlas.parse.pipeline import parse_document
+        from atlas.parse.repository import save_parse_result
 
         _set_status(conn, document_id, "extracting")
-        _run_extract_text(catalog_root, document_id, pdf_path)
-        _run_extract_metadata(catalog_root, document_id, pdf_path)
-        _run_extract_layout(conn, document_id, pdf_path)
-        _run_extract_identifiers(catalog_root, document_id)
-        _run_normalize_identifiers(catalog_root)
+        parsed = parse_document(Path(pdf_path))
 
         _set_status(conn, document_id, "du_processing")
-        from atlas.understanding.pipeline import run_du_pipeline
-        run_du_pipeline(conn, document_id, profile=profile)
+        save_parse_result(conn, document_id, parsed)
+
+        # Identifier aus alter Extraktion (DOI, arXiv etc.) ergänzen
+        _run_extract_identifiers(catalog_root, document_id)
+        _run_normalize_identifiers(catalog_root)
+        _promote_identifiers(conn, document_id)
+
+        # Spracherkennung
         from atlas.pipeline.detect.language import run_detect_language
         run_detect_language(conn, document_id)
 
         _set_status(conn, document_id, "indexing")
-        _promote_du_metadata(conn, document_id)
-        _promote_identifiers(conn, document_id)
         _populate_knowledge_graph(conn, document_id, catalog_root)
         _index_embeddings(conn, document_id, catalog_root)
-        _update_fts(conn, document_id)
+        _update_fts(conn, document_id, parsed=parsed)
 
         _set_status(conn, document_id, "indexed")
 
