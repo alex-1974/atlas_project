@@ -57,3 +57,7 @@ rc
 docs.old/
 legacy_reference/
 atlas_old/
+evaluation/
+*.txt
+
+scripts/
