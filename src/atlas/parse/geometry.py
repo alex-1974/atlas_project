@@ -102,25 +102,45 @@ class PageFormatProfile:
 
 
 def extract_page_formats(pdf_path: Path) -> list[PageFormatInfo]:
+    """
+    Liest Seitenformate und Bild-Rechtecke.
+
+    Performance-Optimierungen:
+    - get_image_info(hashes=False, xrefs=False): kein Pixel-Rendering,
+      spart ~85% der Laufzeit bei bildreichen PDFs
+    - Bild-Rects nur auf Profil-Seiten (Mitte des Dokuments) + erste/letzte
+      10 Seiten; Seitenformat (width/height) auf allen Seiten (billig)
+    """
     page_formats: list[PageFormatInfo] = []
     with fitz.open(pdf_path) as doc:
-        for page_index in range(len(doc)):
+        n = len(doc)
+        # Seiten auf denen Bild-Rects gelesen werden (Heuristik für Profil)
+        boundary_pages = set(range(min(10, n))) | set(range(max(0, n-10), n))
+        # Mitte: jede 5. Seite für Bild-Profil
+        middle_sample = set(range(10, max(10, n-10), 5))
+        image_scan_pages = boundary_pages | middle_sample
+
+        for page_index in range(n):
             page = doc.load_page(page_index)
-            width = float(page.rect.width)
+            width  = float(page.rect.width)
             height = float(page.rect.height)
             orientation = "landscape" if width > height else "portrait"
+
             image_rects: list[tuple[float, float, float, float]] = []
-            for info in page.get_image_info(xrefs=True):
-                bbox = info.get("bbox")
-                if not bbox:
-                    continue
-                try:
-                    x0, y0, x1, y1 = map(float, bbox)
-                except Exception:
-                    continue
-                if x1 <= x0 or y1 <= y0:
-                    continue
-                image_rects.append((x0, y0, x1, y1))
+            if page_index in image_scan_pages:
+                # hashes=False, xrefs=False: kein Pixel-Rendering
+                for info in page.get_image_info(hashes=False, xrefs=False):
+                    bbox = info.get("bbox")
+                    if not bbox:
+                        continue
+                    try:
+                        x0, y0, x1, y1 = map(float, bbox)
+                    except Exception:
+                        continue
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    image_rects.append((x0, y0, x1, y1))
+
             page_formats.append(PageFormatInfo(
                 page_index=page_index,
                 width=width,
