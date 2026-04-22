@@ -386,29 +386,29 @@ def run_pipeline(
             from atlas.db.connection import set_catalog_path
             set_catalog_path(catalog_root)
 
-        # ── Pass 0: Pre-classification ────────────────────────────────────
-        # Runs before any DU step. Determines book_score / structure_score
-        # and boost signals. The profile is passed to run_du_pipeline() so
-        # the Aggregate layer can apply quadrant-specific weights.
-        from atlas.pipeline.profiling import profile_document
-        profile = profile_document(Path(pdf_path))
+        # ── Parse-Pipeline (atlas.parse) ─────────────────────────────────
+        # Ersetzt understanding-basierte DU-Schritte durch direkten
+        # PyMuPDF-Ansatz: Geometry → Typography → Zones → Hint → Metadata
+        # → Sections → Persistenz in SQLite.
+        from atlas.parse.pipeline import parse_document
+        from atlas.parse.repository import save_parse_result
 
         _set_status(conn, document_id, "extracting")
-        _run_extract_text(catalog_root, document_id, pdf_path)
-        _run_extract_metadata(catalog_root, document_id, pdf_path)
-        _run_extract_layout(conn, document_id, pdf_path)
-        _run_extract_identifiers(catalog_root, document_id)
-        _run_normalize_identifiers(catalog_root)
+        parsed = parse_document(Path(pdf_path))
 
         _set_status(conn, document_id, "du_processing")
-        from atlas.understanding.pipeline import run_du_pipeline
-        run_du_pipeline(conn, document_id, profile=profile)
+        save_parse_result(conn, document_id, parsed)
+
+        # Identifier aus alter Extraktion (DOI, arXiv etc.) ergänzen
+        _run_extract_identifiers(catalog_root, document_id)
+        _run_normalize_identifiers(catalog_root)
+        _promote_identifiers(conn, document_id)
+
+        # Spracherkennung
         from atlas.pipeline.detect.language import run_detect_language
         run_detect_language(conn, document_id)
 
         _set_status(conn, document_id, "indexing")
-        _promote_du_metadata(conn, document_id)
-        _promote_identifiers(conn, document_id)
         _populate_knowledge_graph(conn, document_id, catalog_root)
         _index_embeddings(conn, document_id, catalog_root)
         _update_fts(conn, document_id)

@@ -1,158 +1,197 @@
+"""
+atlas.parse.pipeline
+
+Orchestriert die vollständige parse-Pipeline für ein PDF-Dokument.
+
+Öffentliche API:
+    result = parse_document(pdf_path)
+    result: ParsedDocument
+
+Pipeline-Reihenfolge:
+    1. Geometry Profile        (Furniture, Spalten, Body-Region)
+    2. Typography Profile      (dom_size, Font-Familie, Bold/Italic)
+    3. Document Zones          (Frontmatter / Body / Backmatter)
+    4. Document Type Hint      (article/book/report/collection)
+    5. Metadata                (Titel, Autoren, Identifier — mit Reconciliation)
+    6. Sections                (hierarchischer Section-Tree)
+"""
 from __future__ import annotations
 
-import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-import pymupdf as fitz
-
-from .config import ParseConfig
-from .errors import AdapterError, ExtractionError
-from .geometry import build_document_geometry_profile, extract_page_blocks
+from .geometry import build_document_geometry_profile
+from .typography import extract_body_text_profile
+from .document_zones import detect_document_zones
+from .document_type_hints import infer_document_type_hint, DocumentTypeHint
+from .metadata import extract_metadata, ExtractedMetadata
+from .sections import extract_sections, Section
 from .logging import get_logger
-from .models import MetadataResult, ParseResult, TextSegment
 
 logger = get_logger(__name__)
 
+PIPELINE_VERSION = "1.0.0"
 
-class ParsePipeline:
+
+# ---------------------------------------------------------------------------
+# Datenmodell
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParsedDocument:
     """
-    Orchestriert die parsernahe Analyse eines PDF-Dokuments.
+    Vollständiges Ergebnis der parse-Pipeline.
 
-    Reihenfolge:
-    1. Geometry Profile aufbauen (Furniture, Spalten, Body-Region)
-    2. Textsegmente aus Body extrahieren (Header/Footer/Marginalien ausgeklammert)
-    3. Metadaten-Fallbacks
+    Alle Felder sind optional — bei Scan-PDFs oder fehlerhaften Dokumenten
+    können einzelne Felder None/leer sein. `pipeline_ok` gibt an ob die
+    Pipeline ohne Fehler durchgelaufen ist.
     """
+    source_path:   str
 
-    PIPELINE_VERSION = "0.4.0"
+    # Rohe Profil-Objekte (für Downstream-Nutzung)
+    geometry_profile: Any | None = None
+    body_text_profile: Any | None = None
+    zones: Any | None = None
+    doc_hint: DocumentTypeHint | None = None
 
-    def __init__(self, config: ParseConfig | None = None):
-        self.config = config or ParseConfig()
+    # Extrahierte Metadaten
+    metadata: ExtractedMetadata | None = None
 
-    def run(self, pdf_path: Path) -> ParseResult:
-        logger.info("Starting parse: %s", pdf_path)
+    # Section-Tree
+    sections: list[Section] = field(default_factory=list)
 
-        result = ParseResult(source_path=str(pdf_path))
+    # Diagnostik
+    page_count:  int = 0
+    is_scan:     bool = False
+    doc_class:   str | None = None
+    pipeline_ok: bool = True
+    error:       str | None = None
+    pipeline_version: str = PIPELINE_VERSION
 
-        try:
-            document = self._open_document(pdf_path)
+    # Bequeme Properties
+    @property
+    def title(self) -> str | None:
+        return self.metadata.title if self.metadata else None
 
-            logger.debug("Building geometry profile")
-            profile, observations = build_document_geometry_profile(pdf_path)
-            result.diagnostics["geometry_profile"] = profile.to_dict()
+    @property
+    def authors(self) -> list[str]:
+        return self.metadata.authors if self.metadata else []
 
-            logger.debug("Extracting body-oriented text segments")
-            result.text_segments = self._extract_text_segments(pdf_path, profile)
+    @property
+    def year(self) -> int | None:
+        return self.metadata.year if self.metadata else None
 
-            logger.debug("Extracting basic metadata")
-            result.metadata = self._extract_metadata(document, result.text_segments, pdf_path)
+    @property
+    def doi(self) -> str | None:
+        return self.metadata.doi if self.metadata else None
 
-            result.diagnostics.update({
-                "pipeline_version": self.PIPELINE_VERSION,
-                "status": "ok",
-                "page_count": len(document),
-                "text_segment_count": len(result.text_segments),
-            })
+    @property
+    def isbn(self) -> str | None:
+        return self.metadata.isbn if self.metadata else None
 
-            document.close()
-            logger.info("Finished parse: %s", pdf_path)
+    @property
+    def issn(self) -> str | None:
+        return self.metadata.issn if self.metadata else None
 
-        except AdapterError:
-            raise
-        except Exception as exc:
-            logger.exception("Parsing failed for %s", pdf_path)
-            raise ExtractionError(str(exc)) from exc
 
-        return result
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
-    def _open_document(self, pdf_path: Path) -> fitz.Document:
-        try:
-            return fitz.open(pdf_path)
-        except Exception as exc:
-            raise AdapterError(f"Failed to open PDF: {pdf_path}") from exc
+def parse_document(
+    pdf_path: Path | str,
+    max_section_level: int | None = None,
+) -> ParsedDocument:
+    """
+    Führt die vollständige parse-Pipeline für ein PDF-Dokument aus.
 
-    def _extract_text_segments(self, pdf_path: Path, profile) -> list[TextSegment]:
-        """
-        Extrahiert Textsegmente aus dem Body-Bereich.
+    Args:
+        pdf_path: Pfad zum PDF
+        max_section_level: Maximale Section-Tiefe (None = auto aus doc_class)
 
-        Nutzt das Geometry-Profil für:
-        - Header/Footer-Ausschluss (Furniture-Bänder)
-        - Body-Region als primärer Clip
-        - Spalteninformation für zukünftige Segmentierung
-        """
-        blocks, _page_count, _paper_width, _paper_height = extract_page_blocks(pdf_path)
+    Returns:
+        ParsedDocument mit allen extrahierten Daten.
+        Bei Fehlern: pipeline_ok=False, error=Fehlermeldung.
+    """
+    pdf_path = Path(pdf_path)
+    result   = ParsedDocument(source_path=str(pdf_path))
 
-        body = profile.body_region
-        if body is None:
-            return []
+    logger.info("parse_document: %s", pdf_path.name)
 
-        fp = profile.furniture_profile
-        header_band = fp.header_band
-        footer_band = fp.footer_band
+    try:
+        # ── 1. Geometry ───────────────────────────────────────────────────
+        logger.debug("parse: geometry")
+        profile, observations = build_document_geometry_profile(pdf_path)
+        result.geometry_profile = profile
+        result.page_count       = profile.page_count
 
-        segments: list[TextSegment] = []
+        fp  = profile.furniture_profile
+        vp  = profile.vertical_profile
+        pfp = profile.page_format_profile
+        col_width = (
+            vp.dominant_column_lanes[0].width
+            if vp.dominant_column_lanes else 0.0
+        )
 
-        for block in blocks:
-            if block.block_type != 0:
-                continue
-            text = block.text.strip()
-            if not text:
-                continue
+        # ── 2. Typography ─────────────────────────────────────────────────
+        logger.debug("parse: typography")
+        tp = extract_body_text_profile(
+            pdf_path=pdf_path,
+            body_x0=profile.body_region.x0,
+            body_y0=profile.body_region.y0,
+            body_x1=profile.body_region.x1,
+            body_y1=profile.body_region.y1,
+            col_width=col_width,
+            header_y1=fp.header_band.y1 if fp.header_band else None,
+            footer_y0=fp.footer_band.y0 if fp.footer_band else None,
+            profile_page_indexes=pfp.profile_page_indexes if pfp else None,
+            page_count=profile.page_count,
+        )
+        result.body_text_profile = tp
+        result.is_scan = (tp is None or tp.dominant_size <= 0.0)
 
-            # Furniture ausschließen
-            if header_band and block.y1 <= header_band.y1 + 2.0:
-                continue
-            if footer_band and block.y0 >= footer_band.y0 - 2.0:
-                continue
+        # ── 3. Zones ──────────────────────────────────────────────────────
+        logger.debug("parse: zones")
+        zones = detect_document_zones(pdf_path, profile, observations, tp)
+        result.zones = zones
 
-            # Body-Region prüfen
-            if (
-                block.x0 >= body.x0 - 2.0
-                and block.x1 <= body.x1 + 2.0
-                and block.y0 >= body.y0 - 2.0
-                and block.y1 <= body.y1 + 2.0
-            ):
-                segments.append(TextSegment(
-                    text=text,
-                    page=block.page_index + 1,
-                    kind="body_block",
-                    bbox=(block.x0, block.y0, block.x1, block.y1),
-                ))
+        # ── 4. Document Type Hint ─────────────────────────────────────────
+        logger.debug("parse: document type hint")
+        hint = infer_document_type_hint(
+            profile, zones, observations, pdf_path=pdf_path
+        )
+        result.doc_hint  = hint
+        result.doc_class = hint.doc_class
 
-        return segments
+        # ── 5. Metadata ───────────────────────────────────────────────────
+        logger.debug("parse: metadata")
+        meta = extract_metadata(
+            pdf_path, profile, zones, tp, observations=observations
+        )
+        result.metadata = meta
 
-    def _extract_metadata(
-        self,
-        document: fitz.Document,
-        segments: list[TextSegment],
-        pdf_path: Path,
-    ) -> MetadataResult:
-        """
-        Konservative Metadaten-Extraktion.
-        PDF-Titel nur wenn plausibel, sonst Dateiname als Fallback.
-        """
-        metadata = MetadataResult()
-        pdf_meta = document.metadata or {}
+        # ── 6. Sections ───────────────────────────────────────────────────
+        logger.debug("parse: sections")
+        sections = extract_sections(
+            pdf_path, profile, zones, tp,
+            doc_hint=hint,
+            max_level=max_section_level,
+        )
+        result.sections = sections
 
-        title = (pdf_meta.get("title") or "").strip()
-        metadata.title = title if self._looks_like_plausible_title(title) else pdf_path.stem
+        logger.info(
+            "parse_document: %s — %s  title=%r  sections=%d  pages=%d",
+            pdf_path.name,
+            hint.doc_class,
+            meta.title[:40] if meta.title else None,
+            len(sections),
+            profile.page_count,
+        )
 
-        year = self._extract_year(pdf_meta.get("creationDate") or "")
-        if year:
-            metadata.year = year
+    except Exception as exc:
+        logger.exception("parse_document failed: %s", pdf_path)
+        result.pipeline_ok = False
+        result.error       = f"{type(exc).__name__}: {exc}"
 
-        return metadata
-
-    def _looks_like_plausible_title(self, value: str) -> bool:
-        if not value or len(value) < 5:
-            return False
-        bad_suffixes = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
-        if value.lower().strip().endswith(bad_suffixes):
-            return False
-        if "/" in value or "\\" in value:
-            return False
-        return sum(ch.isalpha() for ch in value) >= 4
-
-    def _extract_year(self, date_string: str) -> str | None:
-        match = re.search(r"(19|20)\d{2}", date_string)
-        return match.group(0) if match else None
+    return result

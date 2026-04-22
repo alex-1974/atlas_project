@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from atlas.parse.geometry import GeometryProfile, PageLayoutSignature, build_geometry_profile
+from atlas.parse.geometry import DocumentGeometryProfile, PageGeometryObservation, build_document_geometry_profile
 
 
 @dataclass(slots=True)
@@ -72,7 +72,7 @@ def load_layout_ground_truth_csv(path: Path) -> list[GeometryGroundTruthRow]:
     return parsed
 
 
-def _signature_by_page_number(profile: GeometryProfile) -> dict[int, PageLayoutSignature]:
+def _signature_by_page_number(profile: DocumentGeometryProfile) -> dict[int, PageGeometryObservation]:
     return {sig.page_number: sig for sig in profile.page_layout_signatures}
 
 
@@ -148,7 +148,7 @@ def evaluate_geometry_against_ground_truth(
             )
             continue
 
-        profile = build_geometry_profile(pdf_path)
+        profile = build_document_geometry_profile(pdf_path)
         signatures = _signature_by_page_number(profile)
         evaluated_documents += 1
 
