@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 _LOBID_API  = "https://lobid.org/gnd/search"
 _USER_AGENT = "Atlas/2.0 (atlas-catalog) Python"
-_SLEEP      = 0.8
+_SLEEP      = 0.3
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -157,6 +157,60 @@ def preferred_labels_for_keywords(keywords: list[str]) -> list[str]:
     return labels
 
 
+# ── Section enrichment ───────────────────────────────────────────────────────
+
+def enrich_sections(
+    section_keywords: dict,
+    language: str = "en",
+    max_level: int = 3,
+) -> dict[int | None, list[dict]]:
+    """
+    GND-Lookup für Section-Keywords aus atlas.semantic.keywords.
+
+    Args:
+        section_keywords: {node_id: SectionKeywords} aus semantic.keywords
+        language:         Dokument-Sprache für Normalisierung
+
+    Returns:
+        {node_id: [{"gnd_id": str, "preferred_name": str, "keyword": str}]}
+    """
+    results: dict = {}
+
+    for node_id, sk in section_keywords.items():
+        hits_for_section: list[dict] = []
+        seen_gnd: set[str] = set()
+
+        for kw in sk.keywords[:3]:  # max 3 pro Abschnitt
+            # Varianten für GND-Lookup (Original + normalisiert für DE)
+            variants = _kw_variants(kw, sk.language)
+            for variant in variants:
+                hits = _lobid_search(variant, max_results=2)
+                time.sleep(_SLEEP)
+                for h in hits:
+                    gid = h.get("gnd_id", "")
+                    if gid and gid not in seen_gnd:
+                        seen_gnd.add(gid)
+                        hits_for_section.append({**h, "keyword": kw})
+                if hits_for_section:
+                    break  # Erste erfolgreiche Variante reicht
+
+        results[node_id] = hits_for_section
+
+    return results
+
+
+def _kw_variants(kw: str, language: str) -> list[str]:
+    """
+    Gibt Lookup-Varianten eines Keywords zurück.
+    Nutzt simplemma für Lemmatisierung (Original + Lemma).
+    """
+    try:
+        from atlas.semantic.lemma import lemmatize_keywords
+        return lemmatize_keywords([kw], lang=language)
+    except Exception:
+        return [kw]
+
+
 # ── lobid.org API ─────────────────────────────────────────────────────────────
 
 def _lobid_search(
@@ -201,7 +255,16 @@ def _lobid_search(
                     "preferred_name": label,
                     "type":           types,
                 })
-        return results
+        # Relevanzfilter: mindestens ein substantielles Wort (>4 Zeichen)
+        # muss zwischen Suchterm und GND preferred_name übereinstimmen.
+        # Verhindert Zufallstreffer wie "des Jahres" → "Wildlife-Fotografien"
+        query_words = {w.lower() for w in query.split() if len(w) > 4}
+        filtered = []
+        for r in results:
+            name_words = {w.lower() for w in r["preferred_name"].split()}
+            if query_words & name_words:
+                filtered.append(r)
+        return filtered
 
     except Exception as exc:
         log.debug("lobid GND search failed for %r: %s", query, exc)

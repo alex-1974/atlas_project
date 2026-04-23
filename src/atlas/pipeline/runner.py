@@ -47,20 +47,6 @@ def _set_status(conn: sqlite3.Connection, document_id: str,
 
 # ── Extraction wrappers ───────────────────────────────────────────────────────
 
-def _run_extract_identifiers(catalog_root: Path, document_id: str) -> None:
-    from atlas.db.connection import set_catalog_path
-    set_catalog_path(catalog_root)
-    from atlas.extract.identifiers import extract_identifiers
-    extract_identifiers()
-
-
-def _run_normalize_identifiers(catalog_root: Path) -> None:
-    from atlas.db.connection import set_catalog_path
-    set_catalog_path(catalog_root)
-    from atlas.normalize.identifiers import normalize_identifiers
-    normalize_identifiers()
-
-
 # ── Post-DU helpers ───────────────────────────────────────────────────────────
 
 def _is_corrupt(text: str | None) -> bool:
@@ -406,9 +392,6 @@ def run_pipeline(
         save_parse_result(conn, document_id, parsed)
 
         # Identifier aus alter Extraktion (DOI, arXiv etc.) ergänzen
-        _run_extract_identifiers(catalog_root, document_id)
-        _run_normalize_identifiers(catalog_root)
-        _promote_identifiers(conn, document_id)
 
         # Spracherkennung
         from atlas.pipeline.detect.language import run_detect_language
