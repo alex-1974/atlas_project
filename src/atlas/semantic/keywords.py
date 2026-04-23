@@ -199,6 +199,16 @@ def _clean(keywords: list[str], language: str) -> list[str]:
         # Reine Zahlen überspringen
         if re.fullmatch(r'[\d\s.,%-]+', kw):
             continue
+        # Grammatische Fragmente überspringen (Präpositionen, Artikel als erstes Wort)
+        _GRAM_FRAGMENTS = {
+            "des", "die", "der", "den", "dem", "das", "ein", "eine",
+            "und", "oder", "von", "zu", "in", "an", "auf", "mit",
+            "the", "of", "in", "on", "at", "by", "for", "and", "or",
+            "du", "de", "le", "la", "les", "des", "un", "une",
+        }
+        first_word = kw.split()[0].lower().rstrip(".,;")
+        if first_word in _GRAM_FRAGMENTS:
+            continue
         seen.add(low)
         result.append(kw)
 
