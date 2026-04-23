@@ -754,12 +754,32 @@ def enrich(
 
         if do_sec_kw:
             try:
-                from atlas.enrich.section_keywords import extract_section_keywords
+                from atlas.semantic.section_text import extract_section_texts
+                from atlas.semantic.keywords import extract_keywords
+                from atlas.semantic.persist import (
+                    save_section_keywords, aggregate_document_keywords,
+                    save_document_keywords,
+                )
+                from atlas.parse.geometry import build_document_geometry_profile
 
-                sec_kws = extract_section_keywords(conn, did, force=True)
-                entry["section_keywords"] = len(sec_kws)
+                doc_row = conn.execute(
+                    "SELECT file_path, language FROM documents WHERE document_id=?",
+                    (did,)
+                ).fetchone()
+                pdf_path = Path(doc_row["file_path"])
+                doc_lang = doc_row["language"] or "en"
+
+                profile, _ = build_document_geometry_profile(pdf_path)
+                texts    = extract_section_texts(pdf_path, conn, did, profile=profile)
+                sec_kws  = extract_keywords(texts, document_language=doc_lang)
+                n_saved  = save_section_keywords(conn, did, sec_kws, force=True)
+                doc_kws  = aggregate_document_keywords(sec_kws)
+                save_document_keywords(conn, did, doc_kws, force=True)
+
+                entry["section_keywords"] = n_saved
                 if sec_kws and not as_json:
-                    console.print(f"    Kapitel-Keywords: {len(sec_kws)} Sektionen")
+                    console.print(f"    Kapitel-Keywords: {n_saved} Sektionen, "
+                                  f"{len(doc_kws)} Dokument-Keywords")
             except Exception as exc:
                 entry["section_keywords_error"] = str(exc)
                 if not as_json:
