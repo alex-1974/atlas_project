@@ -202,24 +202,13 @@ def enrich_sections(
 def _kw_variants(kw: str, language: str) -> list[str]:
     """
     Gibt Lookup-Varianten eines Keywords zurück.
-    Für DE: normalisiert das letzte Wort (häufige Genitiv-Endungen).
+    Nutzt simplemma für Lemmatisierung (Original + Lemma).
     """
-    variants = [kw]
-    if language != "de":
-        return variants
-
-    words = kw.split()
-    last = words[-1]
-    # Nur letztes Wort normalisieren (Nomen-Endungen)
-    for suffix in ("hauses", "baues", "werkes", "hauses",
-                   "ens", "es", "em", "er"):
-        if len(last) > 5 + len(suffix) and last.lower().endswith(suffix):
-            normalized_last = last[:-len(suffix)]
-            normalized = " ".join(words[:-1] + [normalized_last])
-            if normalized != kw:
-                variants.append(normalized)
-            break
-    return variants
+    try:
+        from atlas.semantic.lemma import lemmatize_keywords
+        return lemmatize_keywords([kw], lang=language)
+    except Exception:
+        return [kw]
 
 
 # ── lobid.org API ─────────────────────────────────────────────────────────────
