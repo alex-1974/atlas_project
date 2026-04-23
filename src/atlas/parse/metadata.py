@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 # Identifier-Patterns
 # ---------------------------------------------------------------------------
 
-_DOI_RE  = re.compile(r"\b(10\.\d{4,}/\S+?)(?:[.,;)\s]|$)", re.IGNORECASE)
+_DOI_RE  = re.compile(r"\b(10\.\d{4,}/[^\s,;)\]>\"']+)", re.IGNORECASE)
 _ISBN_RE = re.compile(r"ISBN[\s:\-]*([\d\-]{10,17}[\dX])", re.IGNORECASE)
 _ISSN_RE = re.compile(r"ISSN[\s:\-]*(\d{4}-\d{3}[\dX])", re.IGNORECASE)
 _YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|20[0-2]\d)\b")

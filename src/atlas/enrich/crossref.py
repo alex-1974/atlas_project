@@ -160,10 +160,10 @@ def _normalise(work: dict) -> dict:
         result["issn"] = issns[0]
 
     # Volume / issue / pages
-    for key in ("volume", "issue", "page"):
-        val = work.get(key)
+    for cr_key, db_key in (("volume", "volume"), ("issue", "issue"), ("page", "pages")):
+        val = work.get(cr_key)
         if val:
-            result[key] = str(val)
+            result[db_key] = str(val)
 
     # Publisher
     if work.get("publisher"):
@@ -202,20 +202,20 @@ def _write_to_db(
     updates: list[tuple[str, object]] = []
 
     if meta.get("title"):
-        updates.append(("title = COALESCE(NULLIF(title,''), ?)", meta["title"]))
+        # CrossRef ist autoritativ für Titel — überschreibt typografische Extraktion
+        updates.append(("title = ?", meta["title"]))
 
     if meta.get("authors"):
         authors_json = json.dumps(
             [a["name"] for a in meta["authors"]], ensure_ascii=False
         )
-        updates.append((
-            "authors = COALESCE(NULLIF(authors,''), ?)", authors_json
-        ))
+        # CrossRef-Autorenliste ist vollständig und normalisiert
+        updates.append(("authors = ?", authors_json))
 
     if meta.get("year"):
         updates.append(("year = COALESCE(year, ?)", meta["year"]))
 
-    for col in ("journal", "volume", "issue", "publisher"):
+    for col in ("journal", "volume", "issue", "pages", "publisher", "issn"):
         if meta.get(col):
             updates.append((
                 f"{col} = COALESCE(NULLIF({col},''), ?)", meta[col]
