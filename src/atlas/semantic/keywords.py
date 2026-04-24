@@ -15,9 +15,30 @@ Unterstützte Sprachen: DE, EN, FR, NL, IT, LA (Fallback: EN)
 """
 from __future__ import annotations
 
+import math
 import re
 import string
+from collections import Counter
 from dataclasses import dataclass, field
+
+# Sprachagnostischer Token-Qualitätsfilter
+# Nutzt unicode-regex wenn verfügbar (pip install regex)
+try:
+    import regex as _rx
+    _HAS_DIGIT    = _rx.compile(r"\p{L}*\p{N}+\p{L}*")
+    _BAD_REPEAT   = _rx.compile(r"(\X)\1{2,}")
+    _ONLY_WORDISH = _rx.compile(r"^[\p{L}\p{M}\''\- ]+$")
+    _NON_LETTER   = _rx.compile(r"[^\p{L}\p{M}]")
+    _MIXED_SCRIPT = _rx.compile(
+        r"[\p{Script=Latin}].*[\p{Script=Cyrillic}\p{Script=Arabic}]"
+        r"|[\p{Script=Cyrillic}].*[\p{Script=Latin}]"
+    )
+except ImportError:
+    _HAS_DIGIT    = re.compile(r"[a-zA-Z]*\d+[a-zA-Z]*")
+    _BAD_REPEAT   = re.compile(r"(.)\1{2,}")
+    _ONLY_WORDISH = re.compile(r"^[\w\'\-\- ]+$")
+    _NON_LETTER   = re.compile(r"[^\w]")
+    _MIXED_SCRIPT = re.compile(r"(?!)")
 
 from .section_text import SectionText
 
@@ -28,6 +49,29 @@ _MAX_KW_PER_SECTION = 8
 _MIN_WORDS_FOR_YAKE = 25
 
 # Stopwörter pro Sprache — ergänzen YAKE's interne Listen
+_FRAG_START: dict[str, set[str]] = {
+    "de": {"der", "die", "das", "des", "dem", "den", "ein", "eine", "einer",
+           "eines", "einem", "einen", "sche", "schen", "scher", "sches",
+           "liche", "lichen", "licher", "isches", "ische", "ischen"},
+    "en": {"the", "a", "an", "of", "in", "on", "at", "by", "for",
+           "with", "from", "to", "and", "or", "this", "that"},
+    "fr": {"le", "la", "les", "du", "des", "un", "une", "au", "aux",
+           "de", "en", "par", "sur", "dans", "avec", "ce", "cette"},
+    "nl": {"de", "het", "een", "van", "in", "op", "te", "en", "of"},
+    "it": {"il", "lo", "la", "i", "gli", "le", "un", "una",
+           "di", "da", "in", "con", "su", "per"},
+    "la": {"et", "in", "de", "ad", "ex", "cum", "per", "pro"},
+}
+_FRAG_END: dict[str, set[str]] = {
+    "de": {"und", "oder", "aber", "auch", "nur", "noch", "wird", "wurde"},
+    "en": {"and", "or", "but", "the", "a", "an", "of", "in", "is", "are"},
+    "fr": {"et", "ou", "mais", "le", "la", "les", "est", "sont"},
+    "nl": {"en", "of", "maar", "het", "de"},
+    "it": {"e", "o", "ma", "il", "lo", "la"},
+    "la": {"et", "aut", "vel", "sed"},
+}
+
+
 _STOPWORDS: dict[str, set[str]] = {
     "en": {
         "figure", "table", "section", "chapter", "appendix", "reference",
@@ -180,39 +224,246 @@ def _freq_fallback(text: str, language: str, n: int) -> list[str]:
 # Bereinigung
 # ---------------------------------------------------------------------------
 
-def _clean(keywords: list[str], language: str) -> list[str]:
-    """Bereinigt und dedupliziert Keywords."""
-    stops = _STOPWORDS.get(language, _STOPWORDS["en"])
+def _char_entropy(s: str) -> float:
+    """Shannon-Entropie der Zeichen — sprachagnostisch."""
+    t = s.replace(" ", "")
+    if not t: return 0.0
+    n = len(t)
+    counts = Counter(t.lower())
+    return -sum((c/n) * math.log2(c/n) for c in counts.values())
+
+
+# ── Phonotaktische Sprachprofile ────────────────────────────────────────────
+
+_LANG_PROFILES: dict[str, dict] = {
+    "de": {
+        "min_word_len": 4,
+        "max_consonant_run": 6,
+        "vowels": set("aeiouäöüyAEIOUÄÖÜY"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{7,}"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}"),
+    },
+    "en": {
+        "min_word_len": 3,
+        "max_consonant_run": 6,
+        "vowels": set("aeiouAEIOU"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{7,}"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}"),
+    },
+    "fr": {
+        "min_word_len": 2,
+        "max_consonant_run": 5,
+        "vowels": set("aeiouéèêëàâùûüïîœæAEIOUÉÈÊËÀÂÙÛÜÏÎŒÆ"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{6,}"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}"),
+    },
+    "nl": {
+        "min_word_len": 3,
+        "max_consonant_run": 5,
+        "vowels": set("aeiouéëïóöuüAEIOUÉËÏÓÖUÜ"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{6,}"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}"),
+    },
+    "it": {
+        "min_word_len": 3,
+        "max_consonant_run": 4,
+        "vowels": set("aeiouàèéìíîòóùúAEIOUÀÈÉÌÍÎÒÓÙÚ"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{5,}"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}"),
+    },
+    "la": {
+        "min_word_len": 2,
+        "max_consonant_run": 4,
+        "vowels": set("aeiouAEIOU"),
+        "impossible_sequences": [r"[bcdfghjklmnpqrstvwxyz]{5,}", r"[wW]"],
+        "impossible_chars": set("@#$%^&*+=|\\/<>[]{}äöüÄÖÜ"),
+    },
+}
+
+
+def _consonant_runs(word: str, vowels: set) -> int:
+    max_run = current = 0
+    for ch in word.lower():
+        if ch.isalpha() and ch not in vowels:
+            current += 1
+            max_run = max(max_run, current)
+        else:
+            current = 0
+    return max_run
+
+
+def _keyword_phonotactics(kw: str, lang: str) -> bool:
+    profile = _LANG_PROFILES.get(lang, _LANG_PROFILES["en"])
+    for word in kw.split():
+        w = word.strip()
+        if not w:
+            continue
+        if len(w) < profile["min_word_len"]:
+            return False
+        if set(w) & profile["impossible_chars"]:
+            return False
+        for pat in profile["impossible_sequences"]:
+            if re.search(pat, w, re.IGNORECASE):
+                return False
+        if _consonant_runs(w, profile["vowels"]) > profile["max_consonant_run"]:
+            return False
+        letters = [c for c in w if c.isalpha()]
+        if len(letters) > 2:
+            if not any(c.lower() in profile["vowels"] for c in letters):
+                return False
+    return True
+
+
+def _token_quality(token: str) -> int:
+    """
+    Sprachagnostische Keyword-Qualitätsbewertung.
+
+    Nutzt Unicode-Eigenschaften + Shannon-Entropie.
+    Funktioniert für DE/EN/FR/FI/LA/NL ohne sprachspezifische Regeln.
+
+    Score < 0  → OCR-Müll, Zahlen, Script-Mix, niedrige Entropie
+    Score ≥ 0  → akzeptables Keyword
+    """
+    t = token.strip()
+    score = 0
+    if len(t) < 2:
+        return -3
+
+    if not _ONLY_WORDISH.match(t):
+        score -= 2
+    if _HAS_DIGIT.search(t):
+        score -= 3
+    if _BAD_REPEAT.search(t.casefold()):
+        score -= 2
+    if len(t) > 30:
+        score -= 1
+    if _MIXED_SCRIPT.search(t):
+        score -= 3
+
+    # Entropie: echte Wörter aller Sprachen haben ent ≥ 2.5
+    ent = _char_entropy(t)
+    if ent < 1.5:
+        score -= 3   # "AAABBB", "9-^^"
+    elif ent < 2.5:
+        score -= 2   # "MTTQU"
+
+    # Nicht-Buchstaben-Anteil (Leerzeichen ignoriert)
+    t_nospace = t.replace(" ", "")
+    if t_nospace:
+        nlr = len(_NON_LETTER.findall(t_nospace)) / len(t_nospace)
+        if nlr > 0.3:
+            score -= 2
+
+    if _ONLY_WORDISH.match(t):
+        score += 1
+
+    return score
+
+
+def _clean(
+    keywords: list[str],
+    language: str,
+    section_title: str = "",
+) -> list[str]:
+    """
+    Bereinigt und dedupliziert Keywords.
+
+    Filter-Pipeline:
+      1. Interpunktion + Normalisierung
+      2. Stoppwörter
+      3. token_quality (Entropie, Unicode)
+      4. Phonotaktik (sprachspezifisch)
+      5. Grammatische Fragmente (sprachspezifisch)
+      6. Satz-Fragmente (Kleinbuchstabe am Anfang/Ende)
+      7. Layout-Artefakte (Image, Abb., Fig.)
+      8. Titel-Echo
+      9. Deduplizierung
+    """
+    stops      = _STOPWORDS.get(language, _STOPWORDS["en"])
+    frag_start = _FRAG_START.get(language, _FRAG_START.get("en", set()))
+    frag_end   = _FRAG_END.get(language, _FRAG_END.get("en", set()))
+    title_words = set(section_title.lower().split()) if section_title else set()
+
+    _LAYOUT = {
+        "image", "images", "figure", "figures", "fig", "figs",
+        "abbildung", "abb", "photo", "foto",
+        "table", "tabelle", "map", "karte", "plate",
+    }
+
     seen: set[str] = set()
     result: list[str] = []
 
     for kw in keywords:
+        # 1. Normalisierung
         kw = kw.strip(_PUNCT_STRIP).strip()
         kw = " ".join(kw.split())
         if len(kw) < 3:
             continue
+
+        words = kw.split()
+
+        # 2. Stoppwörter
         if kw.lower() in stops:
             continue
-        low = kw.lower()
-        if low in seen:
+
+        # 3. Token-Qualität (Entropie, Unicode, Zahlen)
+        word_scores = [_token_quality(w) for w in words]
+        if any(s < -1 for s in word_scores):
             continue
-        # Reine Zahlen überspringen
+        if sum(word_scores) < 0:
+            continue
+
+        # Reine Zahlen/Satzzeichen
         if re.fullmatch(r'[\d\s.,%-]+', kw):
             continue
-        # Grammatische Fragmente überspringen (Präpositionen, Artikel als erstes Wort)
-        _GRAM_FRAGMENTS = {
-            "des", "die", "der", "den", "dem", "das", "ein", "eine",
-            "und", "oder", "von", "zu", "in", "an", "auf", "mit",
-            "the", "of", "in", "on", "at", "by", "for", "and", "or",
-            "du", "de", "le", "la", "les", "des", "un", "une",
-        }
-        first_word = kw.split()[0].lower().rstrip(".,;")
-        if first_word in _GRAM_FRAGMENTS:
+
+        # 4. CharLM — gelernte Sprachplausibilität (optional)
+        try:
+            from atlas.semantic.charlm import get_model as _get_lm
+            _lm = _get_lm(language)
+            if _lm is not None:
+                if not all(_lm.is_plausible(w) for w in words):
+                    continue
+        except Exception:
+            pass
+
+        # 5. Phonotaktik
+        if not _keyword_phonotactics(kw, language):
+            continue
+
+
+
+        # 6. Grammatische Fragmente (sprachspezifisch)
+        first = words[0].lower().rstrip(".,;")
+        last  = words[-1].lower().rstrip(".,;")
+        if first in frag_start:
+            continue
+        if len(words) > 1 and last in frag_end:
+            continue
+
+        # 7. Satz-Fragmente: Bigramm das mit Kleinbuchstabe beginnt/endet
+        if len(words) > 1:
+            if words[0][0].islower() or words[-1][-1].islower():
+                continue
+
+        # 8. Layout-Artefakte
+        if any(w.lower().rstrip(".,") in _LAYOUT for w in words):
+            continue
+
+        # 9. Titel-Echo: Wörter des Keywords komplett im Abschnittstitel
+        if title_words and len(words) < 3:
+            kw_words = set(kw.lower().split())
+            if kw_words <= title_words:
+                continue
+
+        # 10. Deduplizierung
+        low = kw.lower()
+        if low in seen:
             continue
         seen.add(low)
         result.append(kw)
 
-    # Multiword vor Einzelwörtern, dann nach Länge
+    # Multiword vor Einzelwörtern
     multi  = [k for k in result if len(k.split()) >= 2]
     single = [k for k in result if len(k.split()) == 1 and len(k) >= 4]
     return (multi + single)[:_MAX_KW_PER_SECTION]
@@ -255,7 +506,7 @@ def extract_keywords(
                                  n_keywords=_MAX_KW_PER_SECTION)
             method = "yake"
 
-        keywords = _clean(raw, lang)
+        keywords = _clean(raw, lang, section_title=st.title or "")
 
         results[node_id] = SectionKeywords(
             section_node_id=node_id,
