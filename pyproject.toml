@@ -16,17 +16,21 @@ dependencies = [
     # PDF-Verarbeitung
     "PyMuPDF>=1.24",
     "pdfplumber>=0.11",
-
-    # Konfiguration — tomllib ist ab Python 3.11 eingebaut
 ]
 
 [project.optional-dependencies]
-# Semantische Suche (Phase 2)
+# Keyword-Extraktion + Spracherkennung (atlas enrich --section-keywords)
+semantic = [
+    "yake>=0.4",
+    "simplemma>=1.1",
+    "lingua-language-detector>=2.0",
+]
+# Semantische Suche (atlas similar)
 search = [
     "lancedb>=0.6",
     "sentence-transformers>=3",
 ]
-# Wissensgraph (Phase 2)
+# Wissensgraph (atlas refs, atlas graph)
 graph = [
     "pyoxigraph>=0.3",
 ]
@@ -34,6 +38,15 @@ graph = [
 ocr = [
     "pytesseract>=0.3",
     "Pillow>=10",
+]
+# Alles auf einmal
+all = [
+    "yake>=0.4",
+    "simplemma>=1.1",
+    "lingua-language-detector>=2.0",
+    "lancedb>=0.6",
+    "sentence-transformers>=3",
+    "pyoxigraph>=0.3",
 ]
 # Entwicklung
 dev = [
@@ -49,6 +62,9 @@ atlas = "atlas.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["atlas_old*"]
+
+[tool.setuptools.package-data]
+"atlas.semantic" = ["data/charlm/*.json"]
 
 [tool.ruff]
 line-length = 100

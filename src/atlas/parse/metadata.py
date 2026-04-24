@@ -706,6 +706,23 @@ def _extract_metadata_scan_fallback(
         result.title[:40] if result.title else None,
         result.title_confidence,
     )
+    # CharLM-Validierung des Titels
+    if result.title:
+        try:
+            from atlas.semantic.charlm import text_plausibility
+            doc_lang = result.language or "en"
+            ok, ratio = text_plausibility(result.title, lang=doc_lang, min_ratio=0.5)
+            if not ok:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "metadata: Titel abgelehnt (charlm ratio=%.2f): %r",
+                    ratio, result.title[:40]
+                )
+                result.title = None
+                result.title_confidence = 0.0
+        except Exception:
+            pass
+
     return result
 
 
@@ -877,5 +894,24 @@ def extract_metadata(
         result.doi,
         result.year,
     )
+
+    # CharLM-Validierung des Titels
+    if result.title:
+        try:
+            from atlas.semantic.charlm import text_plausibility
+            ok, ratio = text_plausibility(
+                result.title,
+                lang=result.language or "en",
+                min_ratio=0.5,
+            )
+            if not ok:
+                logger.debug(
+                    "metadata: Titel abgelehnt (charlm %.2f): %r",
+                    ratio, result.title[:40]
+                )
+                result.title = None
+                result.title_confidence = 0.0
+        except Exception:
+            pass
 
     return result

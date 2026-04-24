@@ -175,40 +175,119 @@ class CharLM:
 # ---------------------------------------------------------------------------
 
 _MODEL_CACHE: dict[str, CharLM] = {}
-_MODEL_DIR   = Path.home() / ".atlas" / "charlm"
+_MODEL_DIR      = Path.home() / ".atlas" / "charlm"
+_BUILTIN_DIR    = Path(__file__).parent / "data" / "charlm"
 
 
 def get_model(lang: str, conn: sqlite3.Connection | None = None) -> CharLM | None:
     """
     Gibt ein CharLM-Modell für eine Sprache zurück.
 
-    Reihenfolge:
+    Priorität:
     1. In-Memory Cache
-    2. Gespeichertes Modell in ~/.atlas/charlm/
-    3. Training aus Katalog (wenn conn vorhanden)
-    4. None wenn nicht möglich
+    2. Benutzerspezifisch: ~/.atlas/charlm/{lang}.json
+       (verfeinert durch Katalog-Training)
+    3. Eingebaut: atlas/semantic/data/charlm/{lang}.json
+       (vortrainiert auf Wikipedia-Frequenzlisten)
+    4. Training aus Katalog (wenn conn vorhanden)
+    5. None
     """
     if lang in _MODEL_CACHE:
         return _MODEL_CACHE[lang]
 
-    model_path = _MODEL_DIR / f"{lang}.json"
-    if model_path.exists():
+    # 2. Benutzerspezifisch (Katalog-verfeinert)
+    user_path = _MODEL_DIR / f"{lang}.json"
+    if user_path.exists():
         try:
-            lm = CharLM.load(model_path)
+            lm = CharLM.load(user_path)
             if lm._trained_words >= _MIN_TRAINING_WORDS:
                 _MODEL_CACHE[lang] = lm
                 return lm
         except Exception:
             pass
 
+    # 3. Eingebautes vortrainiertes Modell
+    builtin_path = _BUILTIN_DIR / f"{lang}.json"
+    if builtin_path.exists():
+        try:
+            lm = CharLM.load(builtin_path)
+            if lm._trained_words >= _MIN_TRAINING_WORDS:
+                # Mit Katalog-Daten verfeinern wenn möglich
+                if conn is not None:
+                    catalog_lm = CharLM.train_from_catalog(conn, lang)
+                    if catalog_lm._trained_words >= _MIN_TRAINING_WORDS:
+                        # Merge: beide Modelle kombinieren
+                        for k, v in catalog_lm.counts.items():
+                            lm.counts[k] += v
+                        for k, v in catalog_lm.context_counts.items():
+                            lm.context_counts[k] += v
+                        lm._trained_words += catalog_lm._trained_words
+                        lm.save(user_path)  # Für nächstes Mal cachen
+                _MODEL_CACHE[lang] = lm
+                return lm
+        except Exception:
+            pass
+
+    # 4. Aus Katalog trainieren
     if conn is not None:
         lm = CharLM.train_from_catalog(conn, lang)
         if lm._trained_words >= _MIN_TRAINING_WORDS:
-            lm.save(model_path)
+            _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            lm.save(user_path)
             _MODEL_CACHE[lang] = lm
             return lm
 
     return None
+
+
+def text_plausibility(
+    text: str,
+    lang: str = "en",
+    min_word_score: float = _DEFAULT_THRESHOLD,
+    min_ratio: float = 0.6,
+) -> tuple[bool, float]:
+    """
+    Bewertet die Plausibilität eines Textes (Titel, Autor, Topic, Keyword).
+
+    Args:
+        text:           Zu prüfender Text
+        lang:           Sprache
+        min_word_score: Minimaler CharLM-Score pro Wort
+        min_ratio:      Mindestanteil plausibler Wörter (0.6 = 60%)
+
+    Returns:
+        (is_plausible, ratio) — ratio = Anteil plausibler Wörter
+    """
+    import re
+    lm = get_model(lang)
+    if lm is None:
+        return True, 1.0  # Kein Modell → nicht filtern
+
+    # Wörter extrahieren (mindestens 3 Zeichen)
+    words = re.findall(r"[^\W\d_]{3,}", text)
+    if not words:
+        return False, 0.0
+
+    plausible = sum(1 for w in words if lm.is_plausible(w, min_word_score))
+    ratio = plausible / len(words)
+    return ratio >= min_ratio, ratio
+
+
+def words_plausibility(
+    words: list[str],
+    lang: str = "en",
+    threshold: float = _DEFAULT_THRESHOLD,
+) -> list[tuple[str, bool, float]]:
+    """
+    Bewertet eine Liste von Wörtern einzeln.
+
+    Returns:
+        [(word, is_plausible, score), ...]
+    """
+    lm = get_model(lang)
+    if lm is None:
+        return [(w, True, 0.0) for w in words]
+    return [(w, lm.is_plausible(w, threshold), lm.score(w)) for w in words]
 
 
 def train_all_languages(conn: sqlite3.Connection) -> dict[str, int]:
