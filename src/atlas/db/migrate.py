@@ -63,16 +63,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
 
 def assert_schema_current(conn: sqlite3.Connection) -> None:
-    """Raise if any migration has not been applied."""
-    _ensure_migrations_table(conn)
-    available = {m.version for m in _load_migrations()}
-    missing = sorted(available - _applied_versions(conn))
-    if missing:
-        joined = ", ".join(missing)
-        raise RuntimeError(
-            f"Catalog schema is outdated — missing migrations: {joined}. "
-            f"Run 'atlas dev db migrate' to update."
-        )
+    """Wendet fehlende Migrationen automatisch an (kein Fehler)."""
+    run_migrations(conn)
 
 
 def list_applied(conn: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -115,14 +115,42 @@ def add_directory(
     catalog_root: Path,
     directory: Path,
     resume: bool = False,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
 ) -> dict:
-    """Index all PDFs in a directory (non-recursive by default).
+    """Index all PDFs in a directory.
+
+    Args:
+        include: Glob-Muster die eingeschlossen werden (z.B. ["**/*.pdf"])
+        exclude: Glob-Muster die ausgeschlossen werden (z.B. ["drafts/", "*_temp*"])
 
     Returns:
         {"ok": int, "skipped": int, "failed": int,
          "errors": list[tuple[str, str]]}
     """
-    pdfs   = sorted(directory.rglob("*.pdf"))
+    import fnmatch
+    pdfs = sorted(directory.rglob("*.pdf"))
+
+    # Include-Filter: wenn angegeben, nur passende Pfade
+    if include:
+        pdfs = [
+            p for p in pdfs
+            if any(fnmatch.fnmatch(str(p.relative_to(directory)), pat)
+                   for pat in include)
+            or any(fnmatch.fnmatch(p.name, pat) for pat in include)
+        ]
+
+    # Exclude-Filter: Pfade die einem Muster entsprechen ausschließen
+    if exclude:
+        def _excluded(p: Path) -> bool:
+            rel = str(p.relative_to(directory))
+            return any(
+                fnmatch.fnmatch(rel, pat)
+                or fnmatch.fnmatch(p.name, pat)
+                or any(pat.rstrip("/") in part for part in p.parts)
+                for pat in exclude
+            )
+        pdfs = [p for p in pdfs if not _excluded(p)]
     ok = skipped = failed = 0
     errors: list[tuple[str, str]] = []
 

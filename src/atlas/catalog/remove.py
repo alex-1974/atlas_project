@@ -23,8 +23,12 @@ log = logging.getLogger(__name__)
 def remove_document(
     catalog_root: Path,
     document_id: str,
+    delete_file: bool = False,
 ) -> bool:
     """Remove one document from all index layers.
+
+    Args:
+        delete_file: Wenn True, wird auch die PDF-Datei gelöscht.
 
     Returns True on success, False if not found.
     """
@@ -33,7 +37,7 @@ def remove_document(
     assert_schema_current(conn)
 
     row = conn.execute(
-        "SELECT file_name FROM documents WHERE document_id = ?",
+        "SELECT file_name, file_path FROM documents WHERE document_id = ?",
         (document_id,),
     ).fetchone()
 
@@ -42,6 +46,7 @@ def remove_document(
         return False
 
     file_name = row["file_name"]
+    file_path = Path(row["file_path"]) if row["file_path"] else None
 
     # ── 1. FTS5 ───────────────────────────────────────────────────────────────
     try:
@@ -81,4 +86,13 @@ def remove_document(
                   document_id[:12], exc)
 
     log.info("Removed: %s (%s)", file_name, document_id[:12])
+
+    # PDF-Datei löschen wenn gewünscht
+    if delete_file and file_path and file_path.exists():
+        try:
+            file_path.unlink()
+            log.info("Deleted file: %s", file_path)
+        except Exception as exc:
+            log.warning("Could not delete file %s: %s", file_path, exc)
+
     return True

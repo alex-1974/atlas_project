@@ -191,6 +191,10 @@ def save_parse_result(
 
     conn.commit()
 
+    # Spracherkennung aus Section-Texten
+    if not doc.is_scan and doc.sections:
+        _detect_and_save_language(conn, document_id, doc)
+
     logger.info(
         "save_parse_result: %s — type=%s title=%r sections=%d",
         document_id[:12],
@@ -198,3 +202,53 @@ def save_parse_result(
         (meta.title[:40] if meta and meta.title else None),
         len(doc.sections),
     )
+
+
+def _detect_and_save_language(
+    conn: sqlite3.Connection,
+    document_id: str,
+    doc,
+) -> None:
+    """
+    Erkennt die Dokumentsprache aus den ersten Abschnittstexten
+    und schreibt sie in documents.language.
+
+    Nutzt den Titel + die ersten 3 Abschnittstiteln als Probe-Text.
+    lingua ist schnell genug für diesen kurzen Text.
+    """
+    try:
+        from lingua import Language, LanguageDetectorBuilder
+    except ImportError:
+        return  # lingua nicht installiert — überspringen
+
+    # Probe-Text aus Titel + ersten Abschnittstiteln
+    parts = []
+    if doc.metadata and doc.metadata.title:
+        parts.append(doc.metadata.title)
+    for sec in doc.sections[:5]:
+        if sec.title and len(sec.title) > 10:
+            parts.append(sec.title)
+
+    probe = " ".join(parts).strip()
+    if len(probe) < 20:
+        return
+
+    try:
+        detector = LanguageDetectorBuilder.from_languages(
+            Language.ENGLISH, Language.GERMAN, Language.FRENCH,
+            Language.DUTCH, Language.ITALIAN, Language.LATIN,
+        ).build()
+        lang = detector.detect_language_of(probe[:500])
+        if lang is None:
+            return
+        lang_code = lang.iso_code_639_1.name.lower()
+
+        conn.execute(
+            "UPDATE documents SET language = ? WHERE document_id = ?",
+            (lang_code, document_id),
+        )
+        conn.commit()
+        logger.debug("save_parse_result: language=%s for %s",
+                     lang_code, document_id[:12])
+    except Exception as exc:
+        logger.debug("Language detection failed: %s", exc)

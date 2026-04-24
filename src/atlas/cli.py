@@ -9,9 +9,10 @@ from rich.table import Table
 import logging
 import os
 
-from atlas.catalog.add import add_document
+from atlas.catalog.add import add_document, add_directory
 from atlas.catalog.init import init_catalog
 from atlas.catalog.remove import remove_document
+from atlas.catalog.move import move_document
 from atlas.catalog.update import update_catalog
 from atlas.db.connection import connect
 from atlas.db.migrate import assert_schema_current
@@ -69,11 +70,12 @@ def init(
 @app.command()
 def add(
     target: str = typer.Argument(..., help="PDF-Datei oder Ordner"),
-    resume: bool = typer.Option(
-        False,
-        "--resume",
-        help="Unterbrochenen Lauf fortsetzen",
-    ),
+    resume: bool = typer.Option(False, "--resume",
+        help="Unterbrochenen Lauf fortsetzen"),
+    include: list[str] = typer.Option([], "--include",
+        help="Glob-Muster einschließen, z.B. '**/*.pdf'"),
+    exclude: list[str] = typer.Option([], "--exclude",
+        help="Glob-Muster ausschließen, z.B. 'drafts/'"),
 ) -> None:
     """Ein Dokument oder einen Ordner indexieren."""
     root = _catalog_root()
@@ -99,30 +101,18 @@ def add(
         return
 
     if p.is_dir():
-        pdfs = sorted(p.rglob("*.pdf"))
-        if not pdfs:
-            console.print(f"[yellow]Keine PDFs gefunden in:[/yellow] {p}")
-            raise typer.Exit(0)
-
-        console.print(f"Gefunden: {len(pdfs)} PDF(s)")
-        ok = skipped = failed = 0
-
-        for pdf in pdfs:
-            with console.status(f"{pdf.name}…"):
-                try:
-                    r = add_document(root, pdf)
-                    if r["skipped"]:
-                        skipped += 1
-                    else:
-                        ok += 1
-                        console.print(f"  [green]✓[/green] {pdf.name}")
-                except Exception as exc:
-                    failed += 1
-                    console.print(f"  [red]✗[/red] {pdf.name}: {exc}")
-
-        console.print(
-            f"\n[bold]{ok} indexiert, {skipped} übersprungen, {failed} Fehler[/bold]"
+        result = add_directory(
+            root, p, resume=resume,
+            include=include or None,
+            exclude=exclude or None,
         )
+        console.print(
+            f"[green]{result['ok']} indexiert[/green]  "
+            f"{result['skipped']} übersprungen  "
+            + (f"[red]{result['failed']} Fehler[/red]" if result['failed'] else "")
+        )
+        for name, err in result["errors"]:
+            console.print(f"  [red]✗[/red] {name}: {err}")
         return
 
     console.print(f"[red]Unbekannter Pfadtyp:[/red] {p}")
@@ -149,12 +139,10 @@ def update() -> None:
 @app.command()
 def remove(
     doc_id: str = typer.Argument(..., help="Dokument-ID (auch Präfix)"),
-    yes: bool = typer.Option(
-        False,
-        "--yes",
-        "-y",
-        help="Ohne Rückfrage löschen",
-    ),
+    yes: bool = typer.Option(False, "--yes", "-y",
+        help="Ohne Rückfrage löschen"),
+    delete_file: bool = typer.Option(False, "--delete-file",
+        help="PDF-Datei auch physisch löschen"),
 ) -> None:
     """Dokument aus allen Indexschichten entfernen."""
     root = _catalog_root()
@@ -176,13 +164,32 @@ def remove(
             abort=True,
         )
 
-    ok = remove_document(root, row["document_id"])
+    ok = remove_document(root, row["document_id"], delete_file=delete_file)
     if ok:
         console.print(f"[green]✓ Entfernt:[/green] {row['file_name']}")
         return
 
     console.print("[red]Fehler beim Entfernen.[/red]")
     raise typer.Exit(1)
+
+
+@app.command()
+def mv(
+    source: str = typer.Argument(..., help="PDF-Pfad oder document_id"),
+    destination: str = typer.Argument(..., help="Neuer Pfad oder Verzeichnis"),
+) -> None:
+    """PDF verschieben und Datenbank aktualisieren."""
+    root = _catalog_root()
+    _require_catalog(root)
+    try:
+        result = move_document(root, Path(source), Path(destination))
+        console.print(
+            f"[green]✓[/green] {Path(result['old_path']).name} "
+            f"→ {result['new_path']}"
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        console.print(f"[red]Fehler:[/red] {exc}")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -677,6 +684,8 @@ def enrich(
         help="Keywords pro Kapitel",
     ),
     do_themes: bool = typer.Option(False, "--themes", help="Themen via RVK + Wikidata"),
+    do_concept: bool = typer.Option(False, "--concept",
+        help="Wikidata QID + GND/LCSH/Getty AAT"),
     do_gnd: bool = typer.Option(False, "--gnd", help="GND-Entitäten via lobid.org"),
     do_crossref: bool = typer.Option(False, "--crossref", help="CrossRef"),
     do_wikidata: bool = typer.Option(False, "--wikidata", help="Wikidata"),
@@ -692,7 +701,7 @@ def enrich(
         doc_ids = [
             r["document_id"]
             for r in conn.execute(
-                "SELECT document_id FROM documents WHERE pipeline_status = 'indexed'"
+                "SELECT document_id FROM documents WHERE pipeline_status IN ('indexed', 'du_done')"
             ).fetchall()
         ]
     else:
@@ -880,6 +889,34 @@ def enrich(
                 entry["gnd_error"] = str(exc)
                 if not as_json:
                     console.print(f"    [yellow]GND: {exc}[/yellow]")
+
+        if do_concept:
+            try:
+                from atlas.enrich.concept import lookup_concepts, best_topic
+                from atlas.enrich.concept import save_concepts, save_topic
+
+                doc_row = conn.execute(
+                    "SELECT keywords, language FROM documents WHERE document_id=?",
+                    (did,)
+                ).fetchone()
+                kws_raw = json.loads(doc_row["keywords"] or "[]")
+                doc_lang = doc_row["language"] or "en"
+                if kws_raw:
+                    hits  = lookup_concepts(kws_raw, lang=doc_lang, max_keywords=5)
+                    topic = best_topic(hits, doc_lang=doc_lang)
+                    n     = save_concepts(conn, did, hits)
+                    if topic:
+                        save_topic(conn, did, topic, doc_lang=doc_lang, force=True)
+                    entry["concept"] = [h.qid for h in hits]
+                    if not as_json:
+                        if topic:
+                            console.print(f"    Concept: {topic.label(doc_lang)!r}"
+                                         f" ({topic.qid})")
+                        console.print(f"    Identifier: {n} gespeichert")
+            except Exception as exc:
+                entry["concept_error"] = str(exc)
+                if not as_json:
+                    console.print(f"    [yellow]Concept: {exc}[/yellow]")
 
         if do_crossref:
             try:
